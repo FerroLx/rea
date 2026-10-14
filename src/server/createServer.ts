@@ -10,6 +10,9 @@ import { registerWasmTools } from "./registerWasmTools.js";
 import type { JvmDebugMetadataService } from "../application/jvm/JvmDebugMetadataService.js";
 import { jvmDebugMetadataModule } from "../composition/jvm.js";
 import { registerJvmTools } from "./registerJvmTools.js";
+import type { DexDebugMetadataService } from "../application/dex/DexDebugMetadataService.js";
+import { dexDebugMetadataModule } from "../composition/dex.js";
+import { registerDexTools } from "./registerDexTools.js";
 import { snapshotEnvironment } from "../process/snapshotEnvironment.js";
 import { createPeResourcesService } from "../composition/binaryDiagnostics.js";
 import type { PeResourcesService } from "../application/binaryDiagnostics/PeResourcesService.js";
@@ -143,6 +146,7 @@ export interface CreateServerOptions {
   readonly signalRecording?: SignalRecordingService;
   readonly wasmArtifact?: WasmArtifactService;
   readonly jvmDebugMetadata?: JvmDebugMetadataService;
+  readonly dexDebugMetadata?: DexDebugMetadataService;
   readonly evmInterface?: EvmInterfaceService;
   readonly sqliteDatabase?: SqliteDatabaseService;
   readonly logger?: Logger;
@@ -333,6 +337,10 @@ export const createServer = (
     environment,
     options.jvmDebugMetadata,
   );
+  const dexDebugMetadata = dexDebugMetadataModule.create(
+    environment,
+    options.dexDebugMetadata,
+  );
   const packetCapture =
     options.packetCapture ?? createPacketCaptureService(environment);
   const signalRecording =
@@ -350,6 +358,7 @@ export const createServer = (
       fridaInstrumentation.closeAll(),
       wasmArtifact.close(),
       jvmDebugMetadata.close(),
+      dexDebugMetadata.close(),
       packetCapture.close(),
       signalRecording.close(),
       apktool.close(),
@@ -458,6 +467,7 @@ export const createServer = (
     android,
     wasmArtifact,
     jvmDebugMetadata,
+    dexDebugMetadata,
     evmInterface,
     jeb,
     firmwareAnalysis,
@@ -549,6 +559,7 @@ const registerConfiguredAnalysisTools = (
   android: AndroidAnalysisPort,
   wasmArtifact: Pick<WasmArtifactService, "inspect" | "close">,
   jvmDebugMetadata: Pick<JvmDebugMetadataService, "inspect" | "close">,
+  dexDebugMetadata: Pick<DexDebugMetadataService, "inspect" | "close">,
   evmInterface: EvmInterfaceService,
   jeb: JebAnalysisPort,
   firmwareAnalysis: FirmwareAnalysisService,
@@ -615,6 +626,13 @@ const registerConfiguredAnalysisTools = (
   registerJvmTools(
     server,
     jvmDebugMetadata,
+    toolLogger,
+    recordEvidence,
+    withAdmittedAnalysis,
+  );
+  registerDexTools(
+    server,
+    dexDebugMetadata,
     toolLogger,
     recordEvidence,
     withAdmittedAnalysis,

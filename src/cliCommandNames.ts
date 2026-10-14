@@ -7,6 +7,7 @@ export const CLI_COMMANDS = Object.freeze({
   compareWasmInterfaces: "compare-wasm-interfaces",
   inspectWasmArtifact: "inspect-wasm-artifact",
   inspectJvmDebugMetadata: "inspect-jvm-debug-metadata",
+  inspectDexDebugMetadata: "inspect-dex-debug-metadata",
   inspectSqliteDatabase: "inspect-sqlite-database",
   inspectEvmInterface: "inspect-evm-interface",
   inspectWebNetworkCapture: "inspect-web-network-capture",
