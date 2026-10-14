@@ -28,14 +28,6 @@ export type JarSelection =
 const VERSIONS_PREFIX = "META-INF/versions/";
 
 /**
- * Canonicalize a caller-supplied JAR member path to the internal form ZIP
- * entries use: forward slashes, no leading slash. A JAR member is identified by
- * exactly this string, so normalization happens once here before any match.
- */
-export const normalizeJarEntryPath = (entry: string): string =>
-  entry.replace(/\\/g, "/").replace(/^\/+/, "");
-
-/**
  * Classify an archive member path for the requested class entry: the base entry,
  * a versioned override, or unrelated (`undefined`).
  */

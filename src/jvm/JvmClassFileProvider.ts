@@ -6,10 +6,12 @@ import type {
   JvmDebugMetadataExecution,
   JvmDebugMetadataPort,
 } from "../application/jvm/JvmDebugMetadataPort.js";
+import type { ArtifactEntry } from "../artifacts/ArtifactReader.js";
 import {
-  ArtifactReaderFailure,
-  type ArtifactEntry,
-} from "../artifacts/ArtifactReader.js";
+  looksLikeZip,
+  normalizeArchiveMemberPath,
+  readArchiveMember,
+} from "../artifacts/archiveMember.js";
 import { ZipArtifactReader } from "../artifacts/ZipArtifactReader.js";
 import {
   peekArtifactMagic,
@@ -33,11 +35,7 @@ import { err, ok, type Result } from "../domain/result.js";
 import { hashStableRootArtifactHandle } from "../artifacts/inventory/hashStableRootArtifact.js";
 import { openRegularFile } from "../filesystem/RegularFile.js";
 import { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
-import {
-  classifyJarEntry,
-  normalizeJarEntryPath,
-  resolveJarSelection,
-} from "./jarClassEntry.js";
+import { classifyJarEntry, resolveJarSelection } from "./jarClassEntry.js";
 import { JVM_LIMITS, JVM_PROVIDER_IDENTITY } from "./JvmClassFileRelease.js";
 import { jvmClassFileFailure, mapParseError } from "./jvmFailures.js";
 
@@ -45,10 +43,6 @@ const OPERATION = "inspect_jvm_debug_metadata";
 
 const sha256 = (bytes: Uint8Array): string =>
   createHash("sha256").update(bytes).digest("hex");
-
-/** Local-file-header, empty-archive, and spanned signatures all open with "PK". */
-const looksLikeZip = (bytes: Uint8Array): boolean =>
-  bytes.length >= 2 && bytes[0] === 0x50 && bytes[1] === 0x4b;
 
 /** The smallest class-file major version (JDK 1.1); nothing valid is lower. */
 const MIN_CLASS_MAJOR_VERSION = 45;
@@ -132,7 +126,7 @@ export class JvmClassFileProvider implements JvmDebugMetadataPort {
           ? await this.#inspectClassFile(input, options)
           : await this.#inspectJarEntry(
               input.path,
-              normalizeJarEntryPath(input.entry),
+              normalizeArchiveMemberPath(input.entry),
               input,
               options,
             );
@@ -239,9 +233,10 @@ export class JvmClassFileProvider implements JvmDebugMetadataPort {
         if (!selected.ok) return selected;
         if (options?.signal?.aborted)
           return err(new AnalysisCancelledError(OPERATION));
-        const classBytes = await this.#readEntryBytes(
+        const classBytes = await readArchiveMember(
           reader,
           selected.value.member,
+          JVM_LIMITS.inputBytes,
           options?.signal,
         );
         const parsed = parseJavaClassFile(classBytes);
@@ -316,7 +311,12 @@ export class JvmClassFileProvider implements JvmDebugMetadataPort {
     const multiRelease =
       manifestEntry !== undefined &&
       isMultiReleaseManifest(
-        await this.#readEntryBytes(reader, manifestEntry, signal),
+        await readArchiveMember(
+          reader,
+          manifestEntry,
+          JVM_LIMITS.inputBytes,
+          signal,
+        ),
       );
     if (!multiRelease && requestedRelease !== undefined)
       return err(
@@ -365,39 +365,6 @@ export class JvmClassFileProvider implements JvmDebugMetadataPort {
   }
 
   /** Buffer one archive member, bounded by the class-file input budget. */
-  async #readEntryBytes(
-    reader: ZipArtifactReader,
-    member: ArtifactEntry,
-    signal: AbortSignal | undefined,
-  ): Promise<Uint8Array> {
-    const stream = await reader.open(member, signal);
-    const chunks: Buffer[] = [];
-    let size = 0;
-    for await (const chunk of stream) {
-      if (signal?.aborted) {
-        stream.destroy();
-        throw new ArtifactReaderFailure("cancelled", "JAR read cancelled");
-      }
-      if (!Buffer.isBuffer(chunk)) {
-        stream.destroy();
-        throw new ArtifactReaderFailure(
-          "format",
-          "JAR entry did not yield bytes",
-        );
-      }
-      size += chunk.length;
-      if (size > JVM_LIMITS.inputBytes) {
-        stream.destroy();
-        throw new ArtifactReaderFailure(
-          "limit",
-          `Selected class entry exceeds ${String(JVM_LIMITS.inputBytes)} bytes`,
-        );
-      }
-      chunks.push(chunk);
-    }
-    return Buffer.concat(chunks, size);
-  }
-
   /**
    * Refuse before the (potentially ~50x) expansion into entry objects: a crafted
    * class near the input budget can declare millions of fixed-stride table
