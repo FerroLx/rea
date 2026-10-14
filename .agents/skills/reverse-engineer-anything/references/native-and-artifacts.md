@@ -88,6 +88,19 @@ offsets, local slots and scope ranges to the method's name and descriptor. No
 Java executes; `SourceDebugExtension` stays opaque; decompiler line numbers are
 never substituted for compiler positions.
 
+## Offline DEX debug metadata
+
+Use `inspect_dex_debug_metadata` for a selected local `.dex`, or a
+`classes*.dex` inside an APK/ZIP (`entry` selects one member; omitting it
+summarizes every root dex). Without `class_descriptor` it returns a whole-file
+readiness summary per member (methods with code/debug_info/parameter names, line
+positions, local declarations, distinct source files, and a derived
+`present | partial | stripped`); with `class_descriptor` (e.g. `Lcom/example/Foo;`)
+it returns full per-method detail — names, JVM-form descriptors, and locals
+(including the implicit `this` and parameters) with register/type/scope. Line
+positions may be R8-renumbered synthetic lines needing a mapping file. No Android
+code executes and no device/adb is involved; `odex`/`vdex`/`oat`/`cdex` are refused.
+
 ## Native targets
 
 After `open_binary`, use focused search, procedure, or function tools directly.

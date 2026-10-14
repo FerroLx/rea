@@ -30,6 +30,7 @@ graph TD
         WASM["src/wasm/<br/>caller-supplied WABT; immutable artifact inspection<br/>owned process supervision and retryable workspace cleanup"]
         EVM["src/evm/<br/>unchanged EVMole/WASM in bounded owned worker<br/>explicit carrier parsing and inferred interface adapter"]
         JVM["src/jvm/<br/>in-process class-file/JAR debug-metadata reader<br/>bounded, dependency-free, no target execution"]
+        DEX["src/dex/<br/>in-process DEX/APK debug-metadata reader<br/>bounded multidex selection, no device or execution"]
         HOPPER["src/hopper/<br/>Hopper launch & Unix-socket protocol<br/>BridgeLauncher, HopperClient, protocol"]
         GHIDRA["src/ghidra/<br/>Ghidra discovery, profile & function analysis<br/>snapshot, Unix/Windows transport, bounded lifecycle"]
         IDA["src/ida/<br/>Upstream MCP contract adaptation<br/>live GUI binding or owned headless database"]
@@ -101,6 +102,8 @@ graph TD
     WASM --> DOMAIN
     COMPOSITION --> JVM
     JVM --> DOMAIN
+    COMPOSITION --> DEX
+    DEX --> DOMAIN
     COMPOSITION --> PWNTOOLS
     PWNTOOLS --> PROCESS
     PWNTOOLS --> DOMAIN

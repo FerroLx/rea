@@ -12,8 +12,8 @@
 - [x] Unit + adapter tests; `verify:dex` d8/dexdump real lane (cross-checks local tuples).
 - [x] Resolve independent (Fable) review findings (implicit-parameter seeding blocker et al.).
 - [x] Analyst guide + spec dir + docs index link.
-- [ ] Discoverability parity with other tools (README capability row, reverse-engineer
-      skill source, architecture.mermaid) — shared follow-up with the JVM tool.
+- [x] Discoverability parity (README capability row, reverse-engineer skill source,
+      architecture.mermaid) — landed for both the JVM and DEX tools.
 - [ ] `npm run check:pr` and full guards at PR time (pre-existing unrelated lint errors
       in `artifactComparison.test.ts` / `ManagedCilDecoding.test.ts`, and the `README_tr`
       link drift, are not from this branch).

@@ -113,6 +113,12 @@ explicit path or endpoint and do not need it.
   a JAR, select a class `entry` and optional multi-release `release`. No Java
   executes; decompiler line numbers are never substituted for compiler positions.
   See the [JVM guide](https://github.com/morluto/rea/blob/main/docs/jvm-debug-metadata.md).
+- Explicit local Android DEX (or a `classes*.dex` inside an APK/ZIP):
+  `inspect_dex_debug_metadata`. Reports the DEX `debug_info` (source files, line
+  positions, local-variable names/types/scopes, parameter names) as a whole-file
+  readiness summary, or full per-method detail for one `class_descriptor`. No
+  Android code executes, no device/adb; `odex`/`vdex`/`oat`/`cdex` are refused.
+  See the [DEX guide](https://github.com/morluto/rea/blob/main/docs/dex-debug-metadata.md).
 - Explicit local EVM bytecode carrier: `inspect_evm_interface` with caller-selected
   `raw` or `hex` encoding. Preserve carrier/decoded digests and treat selectors,
   argument strings and mutability as inferred candidates; this performs no chain
