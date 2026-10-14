@@ -16,6 +16,7 @@ import {
 import {
   absentMethodDebug,
   decodeDebugInfo,
+  DEX_THIS_NAME,
   type DexMethodDebug,
 } from "./dexDebugInfo.js";
 import { DexStringResolver } from "./dexStrings.js";
@@ -87,30 +88,37 @@ const methodState = (
   return hasLines && hasLocals ? "present" : "partial";
 };
 
-const methodDebugOf = (
+/**
+ * Decode a method's debug_info with its implicit parameter locals (and `this`)
+ * seeded at address 0 from the code_item register layout and the proto, as the
+ * DEX format and dexdump/ART do. Returns the absent sentinel for a method with
+ * no code or no debug_info.
+ */
+const decodeMethodDebug = (
   bytes: Uint8Array,
   method: DexEncodedMethod,
-): {
-  readonly debug: ReturnType<typeof decodeDebugInfo>;
-  readonly insns: number;
-} => {
-  if (method.codeOff === 0) return { debug: absentMethodDebug(), insns: 0 };
+  resolver: DexStringResolver,
+  classTypeIdx: number,
+): DexMethodDebug => {
+  if (method.codeOff === 0) return absentMethodDebug();
   const code = parseCodeItem(bytes, method.codeOff);
-  if (!code.ok) return { debug: absentMethodDebug(), insns: 0 };
-  const debug =
-    code.value.debugInfoOff === 0
-      ? absentMethodDebug()
-      : decodeDebugInfo(bytes, code.value.debugInfoOff, code.value.insnsSize);
-  return { debug, insns: code.value.insnsSize };
+  if (!code.ok || code.value.debugInfoOff === 0) return absentMethodDebug();
+  return decodeDebugInfo(bytes, code.value.debugInfoOff, code.value.insnsSize, {
+    firstRegister: code.value.registersSize - code.value.insSize,
+    accessFlags: method.accessFlags,
+    thisTypeIdx: classTypeIdx,
+    paramTypes: resolver.methodParameters(method.methodIdx) ?? [],
+  });
 };
 
 const detailOf = (
   bytes: Uint8Array,
   method: DexEncodedMethod,
   resolver: DexStringResolver,
+  classTypeIdx: number,
 ): DexMethodDetail => {
   const hasCode = method.codeOff !== 0;
-  const { debug } = methodDebugOf(bytes, method);
+  const debug = decodeMethodDebug(bytes, method, resolver, classTypeIdx);
   return {
     name: resolver.methodName(method.methodIdx),
     descriptor: resolver.methodDescriptor(method.methodIdx),
@@ -120,7 +128,10 @@ const detailOf = (
     parameterNames: debug.parameterNames.map((idx) => resolver.string(idx)),
     locals: debug.locals.map((local) => ({
       register: local.register,
-      name: resolver.string(local.nameIdx),
+      name:
+        local.nameIdx === DEX_THIS_NAME
+          ? "this"
+          : resolver.string(local.nameIdx),
       type: resolver.typeDescriptor(local.typeIdx),
       signature: resolver.string(local.signatureIdx),
       startAddress: local.startAddress,
@@ -157,27 +168,29 @@ export const assembleClassDetail = (
     descriptor: resolver.typeDescriptor(classDef.classIdx),
     sourceFile: resolver.string(classDef.sourceFileIdx),
     methods: methodsOf(bytes, classDef).map((m) =>
-      detailOf(bytes, m, resolver),
+      detailOf(bytes, m, resolver, classDef.classIdx),
     ),
   };
 };
 
 const classifyReadiness = (
   localDeclarations: number,
-  parameterNames: number,
+  methodsWithParameterNames: number,
   linePositions: number,
 ): DexReadiness => {
-  if (localDeclarations === 0 && parameterNames === 0) return "stripped";
+  if (localDeclarations === 0 && methodsWithParameterNames === 0)
+    return "stripped";
   return linePositions > 0 && localDeclarations > 0 ? "present" : "partial";
 };
 
-/** Whole-file tally and a conservative readiness label; decodes once per debug_info_off. */
+/**
+ * Whole-file tally and a conservative readiness label. Each method's debug_info
+ * is decoded once (with its own parameter layout — so it cannot be cached by
+ * debug_info_off, since two methods sharing one have different implicit locals)
+ * and discarded, keeping peak memory bounded regardless of class count.
+ */
 export const summarizeDex = (dex: DexFile, bytes: Uint8Array): DexSummary => {
   const resolver = new DexStringResolver(bytes, dex.header);
-  const seen = new Map<
-    number,
-    { lines: number; locals: number; params: boolean; setFile: number }
-  >();
   let methodsWithCode = 0;
   let methodsWithDebugInfo = 0;
   let methodsWithParameterNames = 0;
@@ -196,28 +209,19 @@ export const summarizeDex = (dex: DexFile, bytes: Uint8Array): DexSummary => {
     for (const method of methodsOf(bytes, classDef)) {
       if (method.codeOff === 0) continue;
       methodsWithCode += 1;
-      const code = parseCodeItem(bytes, method.codeOff);
-      if (!code.ok || code.value.debugInfoOff === 0) continue;
+      const debug = decodeMethodDebug(
+        bytes,
+        method,
+        resolver,
+        classDef.classIdx,
+      );
+      if (!debug.present) continue;
       methodsWithDebugInfo += 1;
-      let decoded = seen.get(code.value.debugInfoOff);
-      if (decoded === undefined) {
-        const debug = decodeDebugInfo(
-          bytes,
-          code.value.debugInfoOff,
-          code.value.insnsSize,
-        );
-        decoded = {
-          lines: debug.positions.length,
-          locals: debug.locals.length,
-          params: debug.parameterNames.some((idx) => idx >= 0),
-          setFile: debug.setFileEvents,
-        };
-        seen.set(code.value.debugInfoOff, decoded);
-      }
-      linePositions += decoded.lines;
-      localDeclarations += decoded.locals;
-      setFileEvents += decoded.setFile;
-      if (decoded.params) methodsWithParameterNames += 1;
+      linePositions += debug.positions.length;
+      localDeclarations += debug.locals.length;
+      setFileEvents += debug.setFileEvents;
+      if (debug.parameterNames.some((idx) => idx >= 0))
+        methodsWithParameterNames += 1;
     }
   }
 

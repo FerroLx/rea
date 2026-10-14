@@ -332,6 +332,17 @@ const readEncodedMethods = (
   cursor: DexCursor,
   count: number,
 ): Result<DexEncodedMethod[], DexFileParseError> => {
+  // Each encoded_method is at least three ULEB128 bytes; a declared count that
+  // could not fit in the remaining buffer is refused before allocating, so a
+  // crafted class_data cannot force an unbounded method array.
+  if (count > cursor.remaining / 3)
+    return err({
+      kind: "budget-exceeded",
+      offset: cursor.offset,
+      resource: "class-data",
+      declared: count,
+      remaining: cursor.remaining,
+    });
   const methods: DexEncodedMethod[] = [];
   let methodIdx = 0; // indices are cumulative deltas within each list
   for (let i = 0; i < count; i += 1) {

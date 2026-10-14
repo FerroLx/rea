@@ -91,6 +91,39 @@ export class DexStringResolver {
     return `(${params.join("")})${returnDescriptor}`;
   }
 
+  /**
+   * A method's proto parameter types, in declaration order, each with whether it
+   * is wide (long/double — occupies two registers but one parameter slot). Used
+   * to seed the implicit parameter locals that a debug_info_item starts at
+   * address 0. Returns null when the method or proto cannot be resolved.
+   */
+  methodParameters(
+    methodIndex: number,
+  ): { readonly typeIdx: number; readonly wide: boolean }[] | null {
+    if (methodIndex < 0 || methodIndex >= this.header.methodIdsSize)
+      return null;
+    const protoAt = this.header.methodIdsOff + methodIndex * 8 + 2;
+    if (protoAt + 2 > this.bytes.length) return null;
+    const protoIndex = this.view.getUint16(protoAt, true);
+    if (protoIndex >= this.header.protoIdsSize) return null;
+    const parametersOff = this.#u4(
+      this.header.protoIdsOff + protoIndex * 12 + 8,
+    );
+    if (parametersOff === null) return null;
+    if (parametersOff === 0) return [];
+    const size = this.#u4(parametersOff);
+    if (size === null) return null;
+    const params: { typeIdx: number; wide: boolean }[] = [];
+    for (let i = 0; i < size; i += 1) {
+      const at = parametersOff + 4 + i * 2;
+      if (at + 2 > this.bytes.length) return null;
+      const typeIdx = this.view.getUint16(at, true);
+      const descriptor = this.typeDescriptor(typeIdx);
+      params.push({ typeIdx, wide: descriptor === "J" || descriptor === "D" });
+    }
+    return params;
+  }
+
   /** A `type_list` { size u4, list[size] of u2 type_idx }, resolved to descriptors. */
   #typeList(offset: number): string[] | null {
     if (offset === 0) return []; // no parameters

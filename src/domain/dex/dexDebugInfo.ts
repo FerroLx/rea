@@ -33,6 +33,31 @@ export interface DexLinePosition {
   readonly sourceFileIdx: number | null;
 }
 
+/** Sentinel `nameIdx` for the implicit `this` local: it has no string-pool entry. */
+export const DEX_THIS_NAME = -2;
+
+/** `ACC_STATIC`: a static method has no implicit `this` parameter local. */
+const ACC_STATIC = 0x8;
+
+/**
+ * The implicit parameter locals a debug_info_item starts at address 0: a method's
+ * incoming parameters (and `this` for an instance method), seeded before the
+ * opcode walk so that DBG_END_LOCAL / DBG_RESTART on a parameter register is
+ * valid, not a fault. Register layout and types come from the code_item and the
+ * proto; names come from the stream's `parameter_names`.
+ */
+export interface DexParameterLayout {
+  /** `registers_size - ins_size`: the first register holding an incoming parameter. */
+  readonly firstRegister: number;
+  readonly accessFlags: number;
+  /** The declaring class's type index, for the implicit `this`. */
+  readonly thisTypeIdx: number;
+  readonly paramTypes: readonly {
+    readonly typeIdx: number;
+    readonly wide: boolean;
+  }[];
+}
+
 /** A local-variable scope. Name/type/signature are string-pool indices (`-1` = none). */
 export interface DexLocalEntry {
   readonly register: number;
@@ -97,8 +122,38 @@ class DebugInfoWalk {
     bytes: Uint8Array,
     offset: number,
     private readonly insnsSize: number,
+    private readonly layout: DexParameterLayout | undefined,
   ) {
     this.cursor = new DexCursor(bytes, offset);
+  }
+
+  /** Seed the implicit parameter locals (and `this`) live at address 0. */
+  private seedParameters(): void {
+    const layout = this.layout;
+    if (layout === undefined) return;
+    let register = Math.max(0, layout.firstRegister);
+    const open = (reg: number, nameIdx: number, typeIdx: number): void => {
+      const local: LiveLocal = {
+        nameIdx,
+        typeIdx,
+        signatureIdx: -1,
+        startAddress: 0,
+      };
+      this.live.set(reg, local);
+      this.lastByRegister.set(reg, local);
+    };
+    if ((layout.accessFlags & ACC_STATIC) === 0) {
+      open(register, DEX_THIS_NAME, layout.thisTypeIdx);
+      register += 1;
+    }
+    for (let i = 0; i < layout.paramTypes.length; i += 1) {
+      open(
+        register,
+        this.parameterNames[i] ?? -1,
+        layout.paramTypes[i]!.typeIdx,
+      );
+      register += layout.paramTypes[i]!.wide ? 2 : 1;
+    }
   }
 
   private pushLocal(register: number, local: LiveLocal, end: number): void {
@@ -125,6 +180,7 @@ class DebugInfoWalk {
       if (!nameIdx.ok) return false;
       this.parameterNames.push(nameIdx.value);
     }
+    this.seedParameters();
     return true;
   }
 
@@ -190,7 +246,9 @@ class DebugInfoWalk {
       line: this.line,
       sourceFileIdx: this.currentFileIdx,
     });
-    if (this.line <= 0) this.malformed = true;
+    // d8 legitimately emits line 0 for synthetic methods; only a negative line
+    // is structurally impossible.
+    if (this.line < 0) this.malformed = true;
   }
 
   /** Dispatch one non-terminal opcode; returns false to stop on a fault. */
@@ -243,7 +301,7 @@ class DebugInfoWalk {
       if (!op.ok) break;
       if (op.value === DBG_END_SEQUENCE) {
         this.closeLiveAtEnd();
-        return this.result(this.malformed || this.line <= 0);
+        return this.result(this.malformed);
       }
       if (!this.dispatch(op.value)) break;
     }
@@ -262,8 +320,9 @@ export const decodeDebugInfo = (
   bytes: Uint8Array,
   offset: number,
   insnsSize: number,
+  layout?: DexParameterLayout,
 ): DexMethodDebug => {
   if (offset <= 0 || offset >= bytes.length)
     return { ...absentMethodDebug(), present: true, malformed: true };
-  return new DebugInfoWalk(bytes, offset, insnsSize).run();
+  return new DebugInfoWalk(bytes, offset, insnsSize, layout).run();
 };

@@ -74,15 +74,15 @@ const minimalDex = (): Uint8Array => {
   d.u4(0).u4(2).u4(typeListOff);
   const methodIdsOff = d.at();
   d.u2(0).u2(0).u4(1);
+  // static run(int): the single param "x" is an implicit local seeded at reg 0.
   const debugOff = d.at();
-  d.uleb(10).uleb(1).ulebp1(2);
-  d.u1(0x03).uleb(0).ulebp1(2).ulebp1(1);
-  d.u1(0x0e).u1(0x00);
+  d.uleb(10).uleb(1).ulebp1(2); // line_start 10, 1 param name "x"
+  d.u1(0x0e).u1(0x00); // emit position, END_SEQUENCE
   const codeOff = d.at();
   d.u2(1).u2(1).u2(0).u2(0).u4(debugOff).u4(4);
   for (let i = 0; i < 4; i += 1) d.u2(0);
   const classDataOff = d.at();
-  d.uleb(0).uleb(0).uleb(1).uleb(0).uleb(0).uleb(1).uleb(codeOff);
+  d.uleb(0).uleb(0).uleb(1).uleb(0).uleb(0).uleb(0x9).uleb(codeOff); // access public|static
   const classDefsOff = d.at();
   d.u4(0).u4(1).u4(DEX_NO_INDEX).u4(0).u4(0).u4(0).u4(classDataOff).u4(0);
   d.setU4(0, 0x0a786564);
@@ -159,13 +159,22 @@ describe("DexFileProvider loose .dex", () => {
       mode: string;
       class_detail: {
         source_file: string;
-        methods: { name: string; descriptor: string }[];
+        methods: {
+          name: string;
+          descriptor: string;
+          locals: { name: string | null; type: string | null }[];
+        }[];
       };
     };
     expect(r.mode).toBe("class-detail");
     expect(r.class_detail.source_file).toBe("Foo.java");
-    expect(r.class_detail.methods[0]!.name).toBe("run");
-    expect(r.class_detail.methods[0]!.descriptor).toBe("(I)V");
+    const method = r.class_detail.methods[0]!;
+    expect(method.name).toBe("run");
+    expect(method.descriptor).toBe("(I)V");
+    // The implicit parameter local is seeded and resolved (regression guard).
+    expect(method.locals).toContainEqual(
+      expect.objectContaining({ name: "x", type: "I" }),
+    );
   });
 
   it("refuses a class descriptor not present", async () => {

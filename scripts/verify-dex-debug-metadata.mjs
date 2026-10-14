@@ -100,6 +100,12 @@ const dexdumpFacts = async (dexPath) => {
   return {
     linePositions: (stdout.match(/[0-9a-f]+ line=/g) ?? []).length,
     localEntries: (stdout.match(/reg=[0-9]+/g) ?? []).length,
+    // Local names dexdump resolves, e.g. `reg=5 this LDebuggable;` -> "this".
+    localNames: new Set(
+      (stdout.match(/reg=\d+ (\S+) /g) ?? []).map((m) =>
+        m.replace(/reg=\d+ /, "").trim(),
+      ),
+    ),
   };
 };
 
@@ -261,7 +267,21 @@ class Debuggable {
   const compute = detail.class_detail.methods.find((m) => m.name === "compute");
   assert.ok(compute, "compute method should resolve by name");
   assert.equal(compute.descriptor, "(IJ)I", "descriptor should be JVM-form");
-  assert.ok(compute.locals.length > 0, "compute should have resolved locals");
+  // The implicit `this` and both parameters must be present as locals — the
+  // exact regression a counts-only check misses. Cross-check against dexdump:
+  // the names REA reports for compute must all be names dexdump also resolves.
+  const names = new Set(compute.locals.map((l) => l.name));
+  for (const required of ["this", "a", "b"])
+    assert.ok(names.has(required), `compute locals must include ${required}`);
+  for (const name of names)
+    if (name !== null)
+      assert.ok(
+        gOracle.localNames.has(name),
+        `REA local ${name} must be a name dexdump also resolves`,
+      );
+  // `this` is the parameter the old decoder dropped entirely.
+  assert.ok(gOracle.localNames.has("this"), "dexdump should resolve `this`");
+  cases += 1;
 
   // Archive (APK) selection: summarize all, and select one member by entry.
   const apk = join(workspace, "app.apk");

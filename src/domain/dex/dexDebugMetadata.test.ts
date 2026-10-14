@@ -82,18 +82,19 @@ const buildDex = (): Uint8Array => {
   // method_ids: class_idx 0, proto_idx 0, name_idx 1 ("run")
   const methodIdsOff = d.at();
   d.u2(0).u2(0).u4(1);
-  // debug_info_item
+  // debug_info_item — static run(int): the one param "x" is an implicit local
+  // seeded at register 0; no explicit DBG_START_LOCAL needed.
   const debugInfoOff = d.at();
-  d.uleb(10).uleb(1).ulebp1(2); // line_start, 1 param, name "x"
-  d.u1(0x03).uleb(0).ulebp1(2).ulebp1(1); // START_LOCAL reg0 name "x" type "I"
-  d.u1(0x0e).u1(0x00); // special emit, END_SEQUENCE
+  d.uleb(10).uleb(1).ulebp1(2); // line_start 10, 1 param, name "x"
+  d.u1(0x0e).u1(0x00); // special emit (position at line 10), END_SEQUENCE
   // code_item: registers 1, ins 1, outs 0, tries 0, debug_info_off, insns 4
   const codeOff = d.at();
   d.u2(1).u2(1).u2(0).u2(0).u4(debugInfoOff).u4(4);
   for (let i = 0; i < 4; i += 1) d.u2(0); // insns
-  // class_data: 0 static, 0 instance, 1 direct, 0 virtual; method diff0 access1 code
+  // class_data: 0 static,0 instance,1 direct,0 virtual; method diff 0,
+  // access 0x9 (public|static), code_off.
   const classDataOff = d.at();
-  d.uleb(0).uleb(0).uleb(1).uleb(0).uleb(0).uleb(1).uleb(codeOff);
+  d.uleb(0).uleb(0).uleb(1).uleb(0).uleb(0).uleb(0x9).uleb(codeOff);
   // class_def: class_idx 0, access, superclass NO_INDEX, interfaces 0,
   // source_file_idx 0 ("Foo.java"), annotations 0, class_data_off, static 0
   const classDefsOff = d.at();
