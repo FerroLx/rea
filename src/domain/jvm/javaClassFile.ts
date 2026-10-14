@@ -11,6 +11,7 @@
  * malformed or truncated input yields a tagged {@link JavaClassFileParseError}
  * via {@link Result}, never a thrown parse or an unchecked allocation.
  */
+import { decodeModifiedUtf8 } from "../modifiedUtf8.js";
 import { type Result, err, ok } from "../result.js";
 
 /** Constant-pool tags consumed by this reader (JVMS Table 4.4-B). */
@@ -169,48 +170,6 @@ export class ByteCursor {
   }
 }
 
-/** Decode modified-UTF8 (JVMS §4.4.7) into a string; rejects malformed sequences. */
-const decodeModifiedUtf8 = (
-  bytes: Uint8Array,
-  at: number,
-): Result<string, JavaClassFileParseError> => {
-  const isContinuation = (byte: number | undefined): boolean =>
-    byte !== undefined && (byte & 0xc0) === 0x80;
-  let out = "";
-  let i = 0;
-  while (i < bytes.length) {
-    const a = bytes[i]!;
-    if (a === 0 || a >= 0xf0) return err({ kind: "invalid-utf8", offset: at });
-    if (a < 0x80) {
-      out += String.fromCharCode(a);
-      i += 1;
-    } else if (a < 0xe0) {
-      // A 2-byte sequence leads with 110xxxxx (>= 0xc0); 0x80-0xbf are
-      // continuation bytes and are never valid as a lead. (0xc0 0x80 remains
-      // the modified-UTF8 encoding of U+0000 and stays accepted.)
-      if (a < 0xc0 || i + 1 >= bytes.length || !isContinuation(bytes[i + 1]))
-        return err({ kind: "invalid-utf8", offset: at });
-      const b = bytes[i + 1]!;
-      out += String.fromCharCode(((a & 0x1f) << 6) | (b & 0x3f));
-      i += 2;
-    } else {
-      if (
-        i + 2 >= bytes.length ||
-        !isContinuation(bytes[i + 1]) ||
-        !isContinuation(bytes[i + 2])
-      )
-        return err({ kind: "invalid-utf8", offset: at });
-      const b = bytes[i + 1]!;
-      const c = bytes[i + 2]!;
-      out += String.fromCharCode(
-        ((a & 0x0f) << 12) | ((b & 0x3f) << 6) | (c & 0x3f),
-      );
-      i += 3;
-    }
-  }
-  return ok(out);
-};
-
 /** Fixed `info` byte sizes for constant tags whose body is not length-prefixed. */
 const FIXED_CONSTANT_SIZE: Readonly<Record<number, number>> = {
   [CONSTANT_TAG.integer]: 4,
@@ -258,9 +217,10 @@ const parseConstantPool = (
       if (!lenResult.ok) return lenResult;
       const bytesResult = cursor.slice(lenResult.value);
       if (!bytesResult.ok) return bytesResult;
-      const text = decodeModifiedUtf8(bytesResult.value, tagOffset);
-      if (!text.ok) return text;
-      pool.push({ tag: 1, kind: "utf8", value: text.value });
+      const text = decodeModifiedUtf8(bytesResult.value);
+      if (text === null)
+        return err({ kind: "invalid-utf8", offset: tagOffset });
+      pool.push({ tag: 1, kind: "utf8", value: text });
       continue;
     }
     if (tag === CONSTANT_TAG.class) {
