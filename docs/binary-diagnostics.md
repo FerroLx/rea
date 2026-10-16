@@ -210,3 +210,63 @@ Large Evidence envelopes may require a caller-configured MCP transport receive
 buffer because envelope copies add overhead. Requests honor cancellation during
 snapshot reading, directory traversal and payload hashing. The operation reads
 regular files only and rejects symbolic links.
+
+## PE import triage
+
+`inspect_binary_imports` / `inspect-binary-imports` answers "what can this
+Windows PE image do?" from its import, delay-load import and export tables,
+without executing it, opening a disassembler or installing an engine:
+
+```sh
+rea inspect-binary-imports ./sample.exe --json
+rea inspect-binary-imports ./library.dll --detail imports --json
+```
+
+```json
+{
+  "name": "inspect_binary_imports",
+  "arguments": { "path": "/artifacts/sample.exe" }
+}
+```
+
+The default summary is a few kilobytes:
+
+- `capabilities`: imported APIs grouped into behaviour categories (process
+  injection, persistence, service control, keyboard and screen capture,
+  credential access, anti-debug, privilege, download, network, crypto, dynamic
+  resolution, driver loading) with MITRE ATT&CK technique IDs, a total and up
+  to eight APIs each. Every API carries a `strong`, `medium` or `weak` tier and
+  marks `argument_dependent` APIs whose meaning depends on arguments static
+  analysis cannot see. `file_enumeration` is opt-in through `categories`.
+- `imphash`: the import hash exactly as pefile 2024.8.26 computes it (import
+  table only), so it pivots against existing threat-intelligence data.
+- `dlls`: imported DLLs in first-appearance order; API-set names are tagged.
+- `runtime_resolution`: imported resolvers (`GetProcAddress`, `LoadLibrary*`,
+  `Ldr*`) and taxonomy API names that appear as ASCII or UTF-16 strings but are
+  not imported, a weak hint of runtime resolution.
+- `packing`: entry-point section, writable+executable sections, zero-raw large
+  virtual sections, the highest section entropy and the overlay.
+- `format`: architecture, subsystem, DLL and .NET flags.
+
+`detail: "imports"` adds the full import and delay-import tables (ordinal
+imports resolved through pefile's ordinal tables, `ord<N>` otherwise) and the
+export table with forwarders.
+
+The taxonomy is versioned (`taxonomy_version`) and built from Microsoft's API
+documentation and MITRE ATT&CK identifiers; no third-party rule text is
+included. Capabilities mean the image imports APIs consistent with a behaviour,
+never that it performs it: a `weak` tier alone is routine for ordinary
+software, and packing indicators also fire on installers, compressed resources
+and .NET images. APIs resolved by hashing or direct syscalls are not imports
+and are not found.
+
+The image is read once as a stable regular-file snapshot of at most 64 MiB.
+Table walks are bounded by a work budget proportional to the file size;
+exhausting it, or a detail answer above 8 MiB, fails without partial output.
+Malformed tables are reported in `counts` (unreadable entries, unmapped
+delay-load addresses) instead of being guessed. ELF and Mach-O are not yet
+supported.
+
+`npm run verify:binary-imports` builds x86 and x64 mingw-w64 fixtures and
+compares every import, delay import, export, ordinal resolution and the import
+hash with pefile, and the DLL set with llvm-readobj, through both CLI and MCP.

@@ -258,6 +258,22 @@ Ghidra P0 admits raw images only for `6502`. See [raw binary guide](https://gith
 
 Use `annotate_native_function` for one function name and/or entry comments, with at least one explicit change. Review its annotation readback and refreshed dossier inline. Changes are atomic and session-scoped; empty comments clear them, omitted fields preserve them. Later MCP calls observe edits until close. CLI `annotate-native-function` returns the updated analysis before discarding the session. Original executable bytes are unchanged; edits invalidate immutable snapshots. Windows P0 does not admit database mutations. For naming only, `set_address_name` / `set_addresses_names` also work with Ghidra: they name function entries or data addresses (primary labels) and return compact per-address success booleans instead of a dossier.
 
+## Offline PE import triage
+
+Use `inspect_binary_imports` with an absolute `path`, or
+`rea inspect-binary-imports ./sample.exe --json`, to triage a PE image's
+behaviour from its import, delay-import and export tables without opening a
+native target. Weigh `capabilities` by tier: `strong` APIs are rarely imported
+without the behaviour, `weak` ones are everyday imports, and
+`argument_dependent` ones depend on arguments static analysis cannot see.
+`runtime_resolution` lists resolver imports and taxonomy API names present as
+strings but not imported (a weak hint); few imports plus resolvers, an entry
+point outside code, writable+executable sections or high entropy are packing
+facts, not proof. `is_dotnet` means behaviour lives in managed metadata. Pivot
+on `imphash` (pefile-identical). Request `detail: "imports"` for the full
+tables, and open the image in a disassembler only for the APIs that matter. See
+[offline binary diagnostics](https://github.com/morluto/rea/blob/main/docs/binary-diagnostics.md).
+
 ## Offline PE resource inventory
 
 Use `inspect_pe_resources` with an absolute `path`, or

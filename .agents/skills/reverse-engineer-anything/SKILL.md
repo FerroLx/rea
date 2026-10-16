@@ -196,6 +196,12 @@ explicit path or endpoint and do not need it.
   Historical PIDs do not select live processes. Request `include_debugger_context`
   only when core-only mapping candidates help; see the
   [recorded crash guide](https://github.com/morluto/rea/blob/main/docs/recorded-crashes.md).
+- What a Windows PE (.exe, .dll, .sys) can do, before any disassembly:
+  `inspect_binary_imports` with an explicit path. Returns ATT&CK-tagged
+  capability categories with strong/medium/weak tiers, pefile-identical
+  imphash, runtime-resolution hints and packing facts in a few KB; add
+  `detail: "imports"` only when the full tables are needed. Capabilities are
+  "imports consistent with", never a verdict; weak tiers alone mean little.
 - PE resource type/name/language trees and static icon group references:
   `inspect_pe_resources` with an explicit path. This portable operation requires
   no active target or engine; opaque payloads retain file ranges and SHA-256.
