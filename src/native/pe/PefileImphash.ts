@@ -47,6 +47,8 @@ interface Walk {
   readonly work: PeWork;
   /** pefile's section extents, computed once. */
   readonly extents: readonly Extent[];
+  /** pefile's `len(self.header)`, which is not SizeOfHeaders. */
+  readonly headerLength: number;
   /** pefile's `__total_import_symbols`, shared by every table read. */
   symbols: number;
   sinceYield: number;
@@ -80,7 +82,9 @@ const sectionExtents = (bytes: Buffer, layout: PeImageLayout): Extent[] => {
   const fileAlignment = bytes.readUInt32LE(pe + 24 + 36);
   const alignment =
     sectionAlignment < 0x1000 ? fileAlignment : sectionAlignment;
-  const sections = layout.sections;
+  // pefile sorts its sections by VirtualAddress (stable) before every
+  // lookup, and caps each at the next one in that order.
+  const sections = [...layout.sections].sort((a, b) => a.rva - b.rva);
   return sections.map((section, index) => {
     const virtualAddress =
       alignment !== 0 && section.rva % alignment !== 0
@@ -110,6 +114,25 @@ const sectionExtents = (bytes: Buffer, layout: PeImageLayout): Extent[] => {
   });
 };
 
+/**
+ * pefile's header window: the bytes up to the end of the section table, or up
+ * to the lowest 0x200-aligned raw pointer of a section when that is further.
+ */
+const pefileHeaderLength = (bytes: Buffer, layout: PeImageLayout): number => {
+  const pe = bytes.readUInt32LE(60);
+  const optionalSize = bytes.readUInt16LE(pe + 20);
+  const tableEnd = pe + 24 + optionalSize + layout.sections.length * 40;
+  const pointers = layout.sections
+    .map((section) => section.offset)
+    .filter((offset) => offset > 0)
+    .map((offset) => offset & ~0x1ff);
+  const lowest = pointers.length === 0 ? 0 : Math.min(...pointers);
+  return Math.min(
+    bytes.length,
+    lowest === 0 || lowest < tableEnd ? tableEnd : lowest,
+  );
+};
+
 /** pefile's section lookup (first section containing the RVA). */
 const sectionOf = (walk: Walk, rva: number): Extent | undefined =>
   walk.extents.find((extent) => extent.rva <= rva && rva < extent.end);
@@ -122,11 +145,8 @@ const dataAt = (walk: Walk, rva: number, length: number): Buffer => {
     const end = Math.min(offset + length, section.rawEnd);
     return walk.bytes.subarray(offset, Math.max(offset, end));
   }
-  if (rva < walk.layout.headerSize)
-    return walk.bytes.subarray(
-      rva,
-      Math.min(rva + length, walk.layout.headerSize),
-    );
+  if (rva < walk.headerLength)
+    return walk.bytes.subarray(rva, Math.min(rva + length, walk.headerLength));
   if (rva < walk.bytes.length) return walk.bytes.subarray(rva, rva + length);
   throw new PefileFormatError("data at RVA can't be fetched");
 };
@@ -270,6 +290,7 @@ export const pefileImphash = async (
     layout,
     work,
     extents: sectionExtents(bytes, layout),
+    headerLength: pefileHeaderLength(bytes, layout),
     symbols: 0,
     sinceYield: 0,
   };
