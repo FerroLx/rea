@@ -9,7 +9,12 @@ import { wasmArtifactModule } from "../composition/wasm.js";
 import { registerWasmTools } from "./registerWasmTools.js";
 import { snapshotEnvironment } from "../process/snapshotEnvironment.js";
 import { captureProviderEnvironment } from "./providerEnvironment.js";
-import { createPeResourcesService } from "../composition/binaryDiagnostics.js";
+import {
+  createBinaryImportsService,
+  createPeResourcesService,
+} from "../composition/binaryDiagnostics.js";
+import type { BinaryImportsService } from "../application/binaryDiagnostics/BinaryImportsService.js";
+import { registerBinaryImportsTool } from "./registerBinaryImportsTool.js";
 import type { PeResourcesService } from "../application/binaryDiagnostics/PeResourcesService.js";
 import { registerPeResourcesTool } from "./registerPeResourcesTool.js";
 import type { EvmInterfaceService } from "../application/evm/EvmInterfaceService.js";
@@ -311,6 +316,7 @@ export const createServer = (
     options.webModuleTrace ?? createWebModuleTraceService(environment);
   const goBinary = options.goBinary ?? createGoBinaryService();
   const peResources = createPeResourcesService();
+  const binaryImports = createBinaryImportsService();
   const webNetworkCapture =
     options.webNetworkCapture ?? createWebNetworkCaptureService(environment);
   const javascriptRecovery =
@@ -388,6 +394,7 @@ export const createServer = (
       webModuleTrace.close(),
       goBinary.close(),
       peResources.close(),
+      binaryImports.close(),
       webNetworkCapture.close(),
       javascriptRecovery.close?.() ?? Promise.resolve(),
       ...(options.optionalObservationProviderOwner === "caller"
@@ -445,6 +452,7 @@ export const createServer = (
     artifactResources,
     goBinary,
     peResources,
+    binaryImports,
     webNetworkCapture,
   };
   registerBinaryAnalysisTools(toolContext);
@@ -643,6 +651,7 @@ const registerConfiguredAnalysisTools = (
     withAdmittedAnalysis,
     goBinary,
     peResources,
+    binaryImports,
     webNetworkCapture,
   }: ServerToolContext,
   android: AndroidAnalysisPort,
@@ -685,6 +694,13 @@ const registerConfiguredAnalysisTools = (
   registerPeResourcesTool(
     server,
     peResources,
+    toolLogger,
+    recordEvidence,
+    withAdmittedAnalysis,
+  );
+  registerBinaryImportsTool(
+    server,
+    binaryImports,
     toolLogger,
     recordEvidence,
     withAdmittedAnalysis,
@@ -810,6 +826,7 @@ const createSessionRecorders = (
 interface ServerToolContext extends ReturnType<typeof createSessionRecorders> {
   readonly goBinary: GoBinaryService;
   readonly peResources: PeResourcesService;
+  readonly binaryImports: BinaryImportsService;
   readonly webNetworkCapture: WebNetworkCaptureService;
   readonly artifactResources: ArtifactResourceScope;
   readonly server: EvidenceMcpServer;

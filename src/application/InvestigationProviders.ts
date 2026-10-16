@@ -49,6 +49,13 @@ export const PE_RESOURCES_PROVIDER = Object.freeze({
   version: "1",
 } as const);
 
+/** Provider identity for REA's in-process PE import/export scanner. */
+export const BINARY_IMPORTS_PROVIDER = Object.freeze({
+  id: "rea-binary-imports",
+  name: "REA binary import scanner",
+  version: "1",
+} as const);
+
 /** Provider identity for deterministic managed-code comparison workflows. */
 export const MANAGED_WORKFLOW_PROVIDER = {
   id: "rea-dotnet-workflows",

@@ -3,6 +3,7 @@ import {
   createRecordedCrashService,
   createBinaryLayoutService,
   createPeResourcesService,
+  createBinaryImportsService,
 } from "../composition/binaryDiagnostics.js";
 import { CLI_COMMANDS } from "../cliCommandNames.js";
 import { logCliCommand } from "../cliLogging.js";
@@ -48,6 +49,55 @@ export const registerBinaryDiagnosticsCommands = (
               pe,
               "rea-pe-resources",
               "inspect_pe_resources",
+            ),
+        );
+      }),
+  });
+  cli.command(CLI_COMMANDS.inspectBinaryImports, {
+    description:
+      "Triage a PE image's imports: ATT&CK-tagged capabilities, imphash, runtime-resolution hints and packing facts",
+    args: z.object({
+      path: z.string().describe("Local PE image (.exe, .dll, .sys)"),
+    }),
+    options: z.object({
+      categories: z
+        .string()
+        .optional()
+        .describe("Comma-separated categories (default: the sensitive set)"),
+      detail: z
+        .enum(["summary", "imports"])
+        .optional()
+        .describe('"imports" adds the full import and export tables'),
+    }),
+    run: ({ args, options }) =>
+      withCommandCancellation(async (signal) => {
+        const imports = createBinaryImportsService();
+        return await logCliCommand(
+          logger,
+          CLI_COMMANDS.inspectBinaryImports,
+          async () =>
+            finishAnalysisCommand(
+              () =>
+                imports.inspect(
+                  {
+                    path: absoluteCallerPath(args.path),
+                    ...(options.categories === undefined
+                      ? {}
+                      : {
+                          categories: options.categories
+                            .split(",")
+                            .map((c) => c.trim())
+                            .filter((c) => c.length > 0),
+                        }),
+                    ...(options.detail === undefined
+                      ? {}
+                      : { detail: options.detail }),
+                  },
+                  { signal },
+                ),
+              imports,
+              "rea-binary-imports",
+              "inspect_binary_imports",
             ),
         );
       }),

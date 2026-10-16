@@ -18,6 +18,10 @@ import {
   inspectPeResourcesInputSchema,
   peResourcesSchema,
 } from "../../domain/native/peResources.js";
+import {
+  binaryImportsResultSchema,
+  inspectBinaryImportsInputSchema,
+} from "../../domain/native/binaryImports.js";
 
 /** Caller-selected delivery of completed binary layout Evidence. */
 export const inspectBinaryLayoutRequestSchema =
@@ -25,6 +29,25 @@ export const inspectBinaryLayoutRequestSchema =
 
 /** Offline binary diagnostics are independent of macOS process/UI providers. */
 export const BINARY_DIAGNOSTICS_TOOL_CONTRACTS = [
+  {
+    name: "inspect_binary_imports",
+    ...toolContractMetadata("inspect_binary_imports"),
+    kind: "native-provider",
+    description:
+      'Statically triage what a local Windows PE image (.exe, .dll, .sys) can do, without executing it or opening a disassembler. Reads its import, delay-load import and export tables and groups imported APIs into behaviour categories (process injection, persistence, service control, keyboard capture, credential access, anti-debug, download, dynamic API resolution, driver loading, ...) with MITRE ATT&CK technique IDs and a strong/medium/weak confidence tier per API. Also returns the import hash exactly as pefile computes it, DLLs (API-set names tagged), runtime-resolution hints (resolver imports and API names present as strings but not imported) and packing facts (entry-point section, writable+executable sections, section entropy, overlay). Facts for triage, never a verdict: capabilities mean the imports are consistent with a behaviour. detail "imports" adds the full import/export tables. Portable on supported Node hosts; no engine required.',
+    inputSchema: inspectBinaryImportsInputSchema,
+    outputSchema: evidenceResultOf(binaryImportsResultSchema),
+    examples: [
+      {
+        title: "Triage a Windows executable's import surface",
+        input: { path: "/artifacts/sample.exe" },
+      },
+      {
+        title: "Include the full import and export tables",
+        input: { path: "/artifacts/library.dll", detail: "imports" },
+      },
+    ],
+  },
   {
     name: "inspect_pe_resources",
     ...toolContractMetadata("inspect_pe_resources"),
