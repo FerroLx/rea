@@ -170,16 +170,20 @@ export const walkImports = async (
       const names = delayField(bytes.readUInt32LE(at + 16), rvaBased, layout);
       if (name === null || names === null) {
         facts.delayVaUnmapped += 1;
-        continue;
+        break; // the end of the usable table, as for an unreadable descriptor
       }
       nameRva = name;
       lookupRva = names;
     }
     const dll = nameRva === 0 ? null : readName(bytes, layout, nameRva, work);
     const thunks = lookupRva === 0 ? null : layout.availableBytes(lookupRva);
+    // The loader cannot use a descriptor whose DLL name or thunks are not
+    // readable, and pefile treats it as damage: the usable table ends here.
+    // Stopping (rather than skipping) keeps a missing terminator from turning
+    // every following window into a phantom "unreadable" descriptor.
     if (dll === null || thunks === null) {
       facts.unreadableDescriptors += 1;
-      continue;
+      break;
     }
     const maxThunks = Math.floor(thunks.length / thunkWidth);
     let terminated = false;

@@ -104,7 +104,9 @@ export const binaryImportsResultSchema = z.strictObject({
   taxonomy_version: z.string(),
   /**
    * The import hash exactly as pefile 2024.8.26 computes it (import table only,
-   * delay imports excluded); null when there is no import table.
+   * delay imports excluded); null when there is no import table, or when a
+   * descriptor is unreadable (pefile discards such a table, so no comparable
+   * hash exists; `counts.unreadable` reports the damage).
    */
   imphash: z
     .string()

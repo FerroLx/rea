@@ -172,20 +172,20 @@ const scanApiStrings = async (
     // Three linear passes (ASCII and UTF-16LE at both alignments) over bytes
     // that exist: bounded by the file size, polled for cancellation, and not
     // charged to the table-walk budget.
-    let sinceYield = 0;
+    // Polled by bytes scanned, so one long identifier run cannot delay it.
+    let nextYield = start + SCAN_YIELD_BYTES;
     let run = start;
     for (let at = start; at <= end; at++) {
+      if (at >= nextYield) {
+        nextYield = at + SCAN_YIELD_BYTES;
+        await setImmediate();
+        work.signal?.throwIfAborted();
+      }
       if (at < end && isIdent(bytes[at]!)) continue;
       const length = at - run;
       if (length >= MIN_API_STRING && length <= MAX_API_STRING)
         report(bytes.toString("latin1", run, at), run, "ascii");
       run = at + 1;
-      sinceYield += 1;
-      if (sinceYield >= SCAN_YIELD_BYTES) {
-        sinceYield = 0;
-        await setImmediate();
-        work.signal?.throwIfAborted();
-      }
     }
     for (const alignment of [0, 1]) {
       let runStart = start + alignment;
@@ -254,6 +254,9 @@ export const analysePeImports = async (
   const resolverImports = new Set<string>();
   const imphash = createHash("md5");
   let imphashParts = 0;
+  // pefile discards a damaged import table, so a hash over the descriptors
+  // read here would not pivot against its (or VirusTotal's) imphash.
+  let importTableDamaged = false;
   const detailImports: NonNullable<BinaryImportsResult["detail"]>["imports"] =
     [];
   // Detail size is projected while it is collected and refused past the
@@ -345,6 +348,8 @@ export const analysePeImports = async (
       }
     });
     counts.unreadable += facts.unreadableDescriptors;
+    if (table === "import" && facts.unreadableDescriptors > 0)
+      importTableDamaged = true;
     if (table === "delay") counts.delay_va_unmapped = facts.delayVaUnmapped;
   }
   for (const key of dlls.keys())
@@ -433,7 +438,8 @@ export const analysePeImports = async (
       entry_point_rva: layout.entryPoint,
     },
     taxonomy_version: BINARY_IMPORT_TAXONOMY_VERSION,
-    imphash: imphashParts === 0 ? null : imphash.digest("hex"),
+    imphash:
+      imphashParts === 0 || importTableDamaged ? null : imphash.digest("hex"),
     counts,
     categories_scanned: [...categories].sort(),
     capabilities: [...capabilities.entries()]

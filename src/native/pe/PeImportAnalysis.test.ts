@@ -88,4 +88,16 @@ describe("PE import analysis", () => {
       }),
     );
   });
+
+  it("ends the import table at the first unreadable descriptor and withholds the imphash", async () => {
+    const bytes = peImportFixture({ imports: [INJECTION] });
+    // Overwrite the terminator and everything after it with non-zero garbage:
+    // no all-zero descriptor remains, and the next one names no readable DLL.
+    const descriptorsAt = 0x400;
+    bytes.fill(0xaa, descriptorsAt + 20);
+    const report = await analyse(bytes);
+    expect(report.counts.imports).toBe(0);
+    expect(report.counts.unreadable).toBe(1);
+    expect(report.imphash).toBeNull();
+  });
 });
