@@ -26,6 +26,10 @@ interface ImportFixture {
    * sector-rounding loader reads them); the file is padded to stay in range.
    */
   readonly rawPointer?: number;
+  /** Declared FileAlignment (default 0x200). */
+  readonly fileAlignment?: number;
+  /** File offset of the section's bytes (default 0x400). */
+  readonly contentOffset?: number;
   /** Add a load configuration declaring CHPE metadata (a hybrid image). */
   readonly chpeMetadata?: boolean;
   /** COFF machine (default i386). */
@@ -47,6 +51,8 @@ export const peImportFixture = ({
   sectionBytes = 0,
   sizeOfHeaders,
   rawPointer,
+  fileAlignment = 0x200,
+  contentOffset = 0x400,
   chpeMetadata = false,
   machine = 0x14c,
   cliHeader = false,
@@ -135,7 +141,7 @@ export const peImportFixture = ({
   const rawSize =
     Math.ceil(Math.max(content.length, sectionBytes) / 512) * 512 || 512;
   const bytes = Buffer.alloc(
-    RAW + rawSize + Math.max(0, (rawPointer ?? RAW) - RAW),
+    Math.max(contentOffset, rawPointer ?? RAW) + rawSize,
   );
   bytes.writeUInt16LE(0x5a4d, 0);
   bytes.writeUInt32LE(0x80, 60);
@@ -148,7 +154,7 @@ export const peImportFixture = ({
   bytes.writeUInt16LE(0x10b, optional);
   bytes.writeUInt32LE(0x400000, optional + 28); // ImageBase
   bytes.writeUInt32LE(0x1000, optional + 32); // SectionAlignment
-  bytes.writeUInt32LE(0x200, optional + 36); // FileAlignment
+  bytes.writeUInt32LE(fileAlignment, optional + 36);
   bytes.writeUInt32LE(SECTION_RVA + rawSize, optional + 56); // SizeOfImage
   bytes.writeUInt32LE(sizeOfHeaders ?? RAW, optional + 60); // SizeOfHeaders
   bytes.writeUInt16LE(3, optional + 68); // console subsystem
@@ -180,6 +186,6 @@ export const peImportFixture = ({
   bytes.writeUInt32LE(rawSize, section + 16);
   bytes.writeUInt32LE(rawPointer ?? RAW, section + 20);
   bytes.writeUInt32LE(0xc0000040, section + 36); // initialised data, R/W
-  content.copy(bytes, RAW);
+  content.copy(bytes, contentOffset);
   return bytes;
 };

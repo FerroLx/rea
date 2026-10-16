@@ -209,6 +209,20 @@ describe("PE image layouts and table shapes", () => {
     expect(report.imphash).toBe(aligned.imphash);
   });
 
+  it("keeps a PointerToRawData as declared when FileAlignment is below a sector", async () => {
+    const aligned = await analyse(peImportFixture({ imports: [INJECTION] }));
+    const report = await analyse(
+      peImportFixture({
+        imports: [INJECTION],
+        fileAlignment: 0x10,
+        rawPointer: 0x410,
+        contentOffset: 0x410,
+      }),
+    );
+    expect(report.imports).toEqual(aligned.imports);
+    expect(report.counts.unreadable).toBe(0);
+  });
+
   it("reports a descriptor with an empty lookup table as a dependency with no imports", async () => {
     const report = await analyse(
       peImportFixture({ imports: [INJECTION, ["USER32.dll", []]] }),

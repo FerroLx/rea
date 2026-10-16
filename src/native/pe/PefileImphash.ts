@@ -71,7 +71,10 @@ const tick = async (walk: Walk): Promise<void> => {
  * pefile's section extents (`get_VirtualAddress_adj`,
  * `get_PointerToRawData_adj`, `contains_rva`): the virtual address rounded
  * down to the section alignment (the file alignment when that is below a
- * page), the layout's sector-adjusted raw pointer, the raw-or-virtual size (the
+ * page), the raw pointer rounded down to 0x200 even when FileAlignment is
+ * below a sector (the layout's loader offset rounds only from 0x200 up; kept
+ * when it equals the virtual address under a sub-page alignment), the
+ * raw-or-virtual size (the
  * virtual size when the raw data runs past the file) capped at the next
  * section in table order, and reads ending at the unadjusted raw end.
  */
@@ -89,7 +92,10 @@ const sectionExtents = (bytes: Buffer, layout: PeImageLayout): Extent[] => {
       alignment !== 0 && section.rva % alignment !== 0
         ? alignment * Math.floor(section.rva / alignment)
         : section.rva;
-    const pointer = section.offset;
+    const pointer =
+      sectionAlignment < 0x1000 && section.rawPointer === section.rva
+        ? section.rva
+        : section.rawPointer & ~0x1ff;
     let size =
       bytes.length - pointer < section.size
         ? section.virtualSize

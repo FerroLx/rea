@@ -28,10 +28,10 @@ export interface PeSection {
   readonly rva: number;
   readonly virtualSize: number;
   /**
-   * File offset of the section's raw data as the loader reads it: the declared
-   * PointerToRawData rounded down to a 512-byte sector, except in a
-   * low-alignment image (SectionAlignment below a page) whose pointer equals
-   * its RVA. pefile applies the same rule.
+   * File offset of the section's raw data as the loader reads it: with a
+   * FileAlignment of at least a 512-byte sector, the declared PointerToRawData
+   * rounded down to that sector (except in a low-alignment image whose pointer
+   * equals its RVA); otherwise as declared. pefile rounds even below a sector.
    */
   readonly offset: number;
   /** PointerToRawData as declared. */
@@ -112,6 +112,7 @@ export const readPeImageLayout = (bytes: Buffer) => {
     : BigInt(bytes.readUInt32LE(optional + 28));
   const subsystem = bytes.readUInt16LE(optional + 68);
   const sectionAlignment = bytes.readUInt32LE(optional + 32);
+  const fileAlignment = bytes.readUInt32LE(optional + 36);
   const headerSize = bytes.readUInt32LE(optional + 60);
   const table = optional + optionalSize;
   requirePeRange(bytes, table, sectionCount * 40);
@@ -129,7 +130,8 @@ export const readPeImageLayout = (bytes: Buffer) => {
       rva,
       virtualSize: bytes.readUInt32LE(at + 8),
       offset:
-        sectionAlignment < 0x1000 && rawPointer === rva
+        fileAlignment < 0x200 ||
+        (sectionAlignment < 0x1000 && rawPointer === rva)
           ? rawPointer
           : rawPointer - (rawPointer % 0x200),
       rawPointer,
