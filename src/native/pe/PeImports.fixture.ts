@@ -24,6 +24,10 @@ interface ImportFixture {
   readonly rawPointer?: number;
   /** Add a load configuration declaring CHPE metadata (a hybrid image). */
   readonly chpeMetadata?: boolean;
+  /** COFF machine (default i386). */
+  readonly machine?: number;
+  /** Declare a CLI (.NET) header directory entry (its contents are not read). */
+  readonly cliHeader?: boolean;
 }
 
 /**
@@ -40,6 +44,8 @@ export const peImportFixture = ({
   sizeOfHeaders,
   rawPointer,
   chpeMetadata = false,
+  machine = 0x14c,
+  cliHeader = false,
 }: ImportFixture) => {
   const SECTION_RVA = 0x2000;
   const RAW = 0x400;
@@ -127,7 +133,7 @@ export const peImportFixture = ({
   bytes.writeUInt16LE(0x5a4d, 0);
   bytes.writeUInt32LE(0x80, 60);
   bytes.writeUInt32LE(0x4550, 0x80);
-  bytes.writeUInt16LE(0x14c, 0x84); // i386
+  bytes.writeUInt16LE(machine, 0x84);
   bytes.writeUInt16LE(1, 0x86); // one section
   bytes.writeUInt16LE(224, 0x94);
   bytes.writeUInt16LE(0x102, 0x96); // executable, 32-bit
@@ -151,6 +157,10 @@ export const peImportFixture = ({
       importDirectorySize ?? descriptors.length,
       directories + 12,
     );
+  }
+  if (cliHeader) {
+    bytes.writeUInt32LE(SECTION_RVA, directories + 112);
+    bytes.writeUInt32LE(72, directories + 116);
   }
   if (loadConfig !== null) {
     bytes.writeUInt32LE(loadConfig.rva, directories + 80);

@@ -244,4 +244,19 @@ describe("PE image layouts the loader accepts", () => {
     expect(native.limitations.some((l) => l.includes("CHPE"))).toBe(false);
     expect(hybrid.imports).toEqual(native.imports);
   });
+
+  it("decodes a managed ReadyToRun OS-override machine to its base architecture", async () => {
+    // i386 XOR the Linux override (dotnet/runtime pedecoder.h).
+    const linuxX86 = 0x14c ^ 0x7b79;
+    const managed = await analyse(
+      peImportFixture({ machine: linuxX86, cliHeader: true }),
+    );
+    expect(managed.format).toMatchObject({
+      machine: linuxX86,
+      architecture: "x86",
+      is_dotnet: true,
+    });
+    const native = await analyse(peImportFixture({ machine: linuxX86 }));
+    expect(native.format.architecture).toBe("unknown");
+  });
 });

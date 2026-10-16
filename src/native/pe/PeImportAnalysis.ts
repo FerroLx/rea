@@ -498,8 +498,10 @@ export const analysePeImports = async (
       kind: "pe",
       pe32_plus: layout.format === "pe32-plus",
       machine: layout.machine,
+      // A ReadyToRun OS override is meaningful only in a managed image.
       architecture:
-        machine === undefined || machine.nativeOsOverride
+        machine === undefined ||
+        (machine.nativeOsOverride && !(dotnet !== null && dotnet.rva !== 0))
           ? "unknown"
           : machine.architecture,
       subsystem: layout.subsystem,
