@@ -458,6 +458,7 @@ export interface PeExportWalkFacts {
   readonly entries: number;
   /** Visited entries carrying a name (several names may share one slot). */
   readonly named: number;
+  /** Visited forwarder entries (per name, like `entries`). */
   readonly forwarders: number;
   readonly unreadable: number;
 }
@@ -534,7 +535,6 @@ export const walkExports = async (
     // An RVA inside the export directory is a forwarder string, not code.
     const forwarded = rva >= directory.rva && rva < exportEnd;
     const target = forwarded ? readName(bytes, layout, rva, work) : null;
-    if (forwarded) forwarders += 1;
     for (const nameIndex of nameOf.get(slot) ?? [null]) {
       const name =
         nameIndex === null
@@ -547,8 +547,12 @@ export const walkExports = async (
             );
       entries += 1;
       if (name !== null) named += 1;
-      if (forwarded) visit({ kind: "forwarder", ordinal, name, target });
-      else visit({ kind: "function", ordinal, name, rva });
+      // Counted per visited entry, like exports and pefile's symbols: two
+      // names aliasing one forwarded slot are two forwarders.
+      if (forwarded) {
+        forwarders += 1;
+        visit({ kind: "forwarder", ordinal, name, target });
+      } else visit({ kind: "function", ordinal, name, rva });
     }
   }
   return {

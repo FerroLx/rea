@@ -183,7 +183,7 @@ describe("PE import analysis", () => {
   });
 });
 
-describe("PE image layouts the loader accepts", () => {
+describe("PE image layouts and table shapes", () => {
   it("reads section raw data inside SizeOfHeaders, as the loader does for older UPX images", async () => {
     const report = await analyse(
       peImportFixture({
@@ -258,5 +258,25 @@ describe("PE image layouts the loader accepts", () => {
     });
     const native = await analyse(peImportFixture({ machine: linuxX86 }));
     expect(native.format.architecture).toBe("unknown");
+  });
+
+  it("counts each name aliasing a forwarded slot as a forwarder, like exports", async () => {
+    const report = await analyse(
+      peImportFixture({
+        exports: [
+          { name: "Alpha", slot: 0, forwarder: "OTHER.Target" },
+          { name: "Beta", slot: 0, forwarder: "OTHER.Target" },
+          { name: "Gamma", slot: 1 },
+        ],
+      }),
+    );
+    expect(
+      report.exports.entries.filter((e) => e.kind === "forwarder"),
+    ).toHaveLength(2);
+    expect(report.counts).toMatchObject({
+      exports: 3,
+      exports_named: 3,
+      forwarders: 2,
+    });
   });
 });

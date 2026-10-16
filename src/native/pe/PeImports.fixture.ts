@@ -6,10 +6,14 @@ interface ImportFixture {
    * descriptor table including its terminator).
    */
   readonly importDirectorySize?: number;
-  /** Export names; names sharing a slot number alias one function. */
+  /**
+   * Export names; names sharing a slot number alias one function. A slot with
+   * a `forwarder` (`DLL.Function`) points into the export directory.
+   */
   readonly exports?: readonly {
     readonly name: string;
     readonly slot: number;
+    readonly forwarder?: string;
   }[];
   /** Extra bytes appended to the section (e.g. strings), at its end. */
   readonly data?: Buffer;
@@ -105,6 +109,9 @@ export const peImportFixture = ({
     sorted.forEach(({ slot }, i) => ordinals.writeUInt16LE(slot, i * 2));
     const ordinalsAt = put(ordinals, 2);
     const dllAt = cString("fixture.dll");
+    for (const { slot, forwarder } of exports)
+      if (forwarder !== undefined)
+        functions.writeUInt32LE(SECTION_RVA + cString(forwarder), slot * 4);
     header.writeUInt32LE(SECTION_RVA + dllAt, 12);
     header.writeUInt32LE(1, 16); // ordinal base
     header.writeUInt32LE(functionCount, 20);
@@ -112,7 +119,7 @@ export const peImportFixture = ({
     header.writeUInt32LE(SECTION_RVA + functionsAt, 28);
     header.writeUInt32LE(SECTION_RVA + namesAt, 32);
     header.writeUInt32LE(SECTION_RVA + ordinalsAt, 36);
-    exportDirectory = { rva: SECTION_RVA + headerAt, size: 40 };
+    exportDirectory = { rva: SECTION_RVA + headerAt, size: cursor - headerAt };
   }
   let loadConfig: { rva: number; size: number } | null = null;
   if (chpeMetadata) {
