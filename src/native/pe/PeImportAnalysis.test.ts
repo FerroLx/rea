@@ -110,7 +110,40 @@ describe("PE import analysis", () => {
     const bytes = peImportFixture({ imports: [INJECTION] });
     bytes.fill(0xaa, 0x400 + 20); // no all-zero descriptor ever follows
     const report = await analyse(bytes);
-    expect(report.counts.unreadable).toBe(6);
+    // The first descriptor's name is overwritten too: dropped without counting
+    // toward the limit (pefile); the next six have no usable thunks and do.
+    expect(report.counts.unreadable).toBe(7);
     expect(report.limitations.at(-1)).toContain("more than five descriptors");
+  });
+
+  it("does not let nameless decoy descriptors end the walk (pefile counts only empty thunks)", async () => {
+    const bytes = peImportFixture({
+      imports: [
+        ...Array.from(
+          { length: 6 },
+          (_, i) => [`decoy${String(i)}.dll`, ["printf"]] as const,
+        ),
+        INJECTION,
+      ],
+    });
+    for (let i = 0; i < 6; i++)
+      bytes.writeUInt32LE(0x7fff0000, 0x400 + i * 20 + 12); // Name unmapped
+    const report = await analyse(bytes);
+    expect(report.counts.unreadable).toBe(6);
+    expect(report.capabilities.map((c) => c.category)).toContain(
+      "process_injection",
+    );
+    // pefile 2024.8.26 on the same bytes.
+    expect(report.imphash).toBe("f912da22ec1b66d09c386ee92da61a68");
+  });
+
+  it("hashes a DLL name outside pefile's filename charset as *invalid*", async () => {
+    const report = await analyse(
+      peImportFixture({
+        imports: [["ker\u0001nel.dll", ["WriteProcessMemory"]]],
+      }),
+    );
+    // pefile 2024.8.26 on the same bytes.
+    expect(report.imphash).toBe("380339ab1085cc666c191cdf275d4ade");
   });
 });

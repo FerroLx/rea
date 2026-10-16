@@ -68,11 +68,19 @@ const SCN_MEM_WRITE = 0x80000000;
 
 const isApiSet = (dll: string): boolean => /^(api|ext)-ms-/i.test(dll);
 
-/** pefile's imphash library name: lowercased, with only a dll/ocx/sys extension stripped. */
+/** pefile's `allowed_filename` plus path separators (`is_valid_dos_filename`). */
+const DOS_FILENAME = /^[A-Za-z0-9!#$%&'()\-@^_`{}~+,.;=[\]:\\/]*$/;
+
+/**
+ * pefile's imphash library name: a name outside its DOS filename charset is
+ * `*invalid*`; otherwise lowercased with only a dll/ocx/sys extension stripped
+ * (`rsplit(".", 1)`, so `.dll` becomes the empty name).
+ */
 const imphashLibrary = (dll: string): string => {
+  if (!DOS_FILENAME.test(dll)) return "*invalid*";
   const lower = dll.toLowerCase();
   const dot = lower.lastIndexOf(".");
-  return dot > 0 && ["dll", "ocx", "sys"].includes(lower.slice(dot + 1))
+  return dot !== -1 && ["dll", "ocx", "sys"].includes(lower.slice(dot + 1))
     ? lower.slice(0, dot)
     : lower;
 };

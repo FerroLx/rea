@@ -270,7 +270,7 @@ without the behaviour, `weak` ones are everyday imports, and
 strings but not imported (a weak hint); few imports plus resolvers, an entry
 point outside code, writable+executable sections or high entropy are packing
 facts, not proof. `is_dotnet` means behaviour lives in managed metadata. Pivot
-on `imphash` (pefile-identical). Request `detail: "imports"` for the full
+on `imphash` (pefile-identical on well-formed tables; on damaged tables pefile may discard what REA still reports, so the hashes can differ). Request `detail: "imports"` for the full
 tables, and open the image in a disassembler only for the APIs that matter. See
 [offline binary diagnostics](https://github.com/morluto/rea/blob/main/docs/binary-diagnostics.md).
 

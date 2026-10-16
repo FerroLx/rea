@@ -191,14 +191,29 @@ export const walkImports = async (
       nameRva = name;
       lookupRva = names;
     }
-    const dll = nameRva === 0 ? null : readName(bytes, layout, nameRva, work);
     const thunks = lookupRva === 0 ? null : layout.availableBytes(lookupRva);
-    if (dll === null || thunks === null) {
+    const maxThunks =
+      thunks === null ? 0 : Math.floor(thunks.length / thunkWidth);
+    const firstThunkEmpty =
+      thunks === null ||
+      maxThunks === 0 ||
+      (thunkWidth === 8
+        ? bytes.readBigUInt64LE(thunks.offset) === 0n
+        : bytes.readUInt32LE(thunks.offset) === 0);
+    // pefile counts a descriptor toward its failure limit only when its thunks
+    // yield no imports; an unreadable DLL name merely drops the descriptor.
+    // Counting names too would let planted nameless decoys end the walk early
+    // and hide the descriptors pefile (and VirusTotal) still read.
+    if (thunks === null || firstThunkEmpty) {
       facts.unreadableDescriptors += 1;
       unusable += 1;
       continue;
     }
-    const maxThunks = Math.floor(thunks.length / thunkWidth);
+    const dll = nameRva === 0 ? null : readName(bytes, layout, nameRva, work);
+    if (dll === null || dll === "") {
+      facts.unreadableDescriptors += 1;
+      continue;
+    }
     let terminated = false;
     for (let t = 0; t < maxThunks; t++) {
       charge(work, 1);
