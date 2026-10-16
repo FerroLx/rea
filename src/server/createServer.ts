@@ -315,6 +315,7 @@ export const createServer = (
   const webModuleTrace =
     options.webModuleTrace ?? createWebModuleTraceService(environment);
   const goBinary = options.goBinary ?? createGoBinaryService();
+  const rustBinary = options.rustBinary ?? createRustBinaryService();
   const peResources = createPeResourcesService();
   const binaryImports = createBinaryImportsService();
   const webNetworkCapture =
@@ -373,10 +374,14 @@ export const createServer = (
   const jeb = options.jebAnalysis ?? createJebAnalysisProvider(environment);
   const adbDevice =
     options.adbDeviceAnalysis ?? createAdbDeviceAnalysisProvider(environment);
+  const cutter = new CutterBridgeService(
+    new CutterBridgeClient(providerEnvironment),
+  );
   let providerClose: Promise<void> | undefined;
   const closeProviders = (): Promise<void> => {
     providerClose ??= Promise.allSettled([
       android.close(),
+      cutter.close(),
       fridaInstrumentation.closeAll(),
       wasmArtifact.close(),
       packetCapture.close(),
@@ -393,6 +398,7 @@ export const createServer = (
       webSourceLocation.close(),
       webModuleTrace.close(),
       goBinary.close(),
+      rustBinary.close(),
       peResources.close(),
       binaryImports.close(),
       webNetworkCapture.close(),
@@ -451,6 +457,7 @@ export const createServer = (
     withAdmittedAnalysis: analysisAdmission,
     artifactResources,
     goBinary,
+    rustBinary,
     peResources,
     binaryImports,
     webNetworkCapture,
@@ -489,7 +496,7 @@ export const createServer = (
   );
   registerCutterTools(
     server,
-    new CutterBridgeService(new CutterBridgeClient(providerEnvironment)),
+    cutter,
     toolLogger,
     delivery,
     session === undefined
@@ -650,6 +657,7 @@ const registerConfiguredAnalysisTools = (
     recordEvidence,
     withAdmittedAnalysis,
     goBinary,
+    rustBinary,
     peResources,
     binaryImports,
     webNetworkCapture,
@@ -714,7 +722,7 @@ const registerConfiguredAnalysisTools = (
   );
   registerRustTools(
     server,
-    options.rustBinary ?? createRustBinaryService(),
+    rustBinary,
     toolLogger,
     recordEvidence,
     withAdmittedAnalysis,
@@ -825,6 +833,7 @@ const createSessionRecorders = (
 
 interface ServerToolContext extends ReturnType<typeof createSessionRecorders> {
   readonly goBinary: GoBinaryService;
+  readonly rustBinary: RustBinaryService;
   readonly peResources: PeResourcesService;
   readonly binaryImports: BinaryImportsService;
   readonly webNetworkCapture: WebNetworkCaptureService;

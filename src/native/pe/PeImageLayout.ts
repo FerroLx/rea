@@ -44,6 +44,23 @@ export interface PeDataDirectory {
 export const virtualExtent = (section: PeSection): number =>
   section.virtualSize === 0 ? section.size : section.virtualSize;
 
+// Intersection normalized with those ownership rules: a section without
+// virtual extent owns no byte and never conflicts, while an empty interval
+// owns exactly its start point, so a positive-extent section starting there
+// conflicts with header-backed ownership of the same RVA.
+const intersectsInterval = (
+  section: PeSection,
+  rva: number,
+  size: number,
+): boolean => {
+  const extent = virtualExtent(section);
+  return (
+    extent > 0 &&
+    section.rva < rva + Math.max(size, 1) &&
+    rva < section.rva + extent
+  );
+};
+
 /**
  * The single engine-free owner of PE header admission and RVA-to-file mapping.
  * It validates the MZ/PE headers, the optional header and section table, and
@@ -149,11 +166,7 @@ export const readPeImageLayout = (bytes: Buffer) => {
         : containing;
     if (rva < headerSize) {
       if (
-        sections.some(
-          (section) =>
-            section.rva < rva + size &&
-            section.rva + virtualExtent(section) > rva,
-        ) ||
+        sections.some((section) => intersectsInterval(section, rva, size)) ||
         size > headerSize - rva
       )
         peFailure(`Ambiguous ${lower} header RVA mapping.`);
@@ -169,13 +182,11 @@ export const readPeImageLayout = (bytes: Buffer) => {
       peFailure(`${subject} range leaves its section's virtual size.`);
     if (within > section.size || size > section.size - within)
       peFailure(`${subject} range is not entirely file-backed in one section.`);
-    // A second section starting inside the requested interval is ambiguous too.
+    // A second section with virtual extent inside the requested interval is
+    // ambiguous too; a zero-extent section owns no byte there.
     if (
       sections.some(
-        (other) =>
-          other !== section &&
-          other.rva < rva + size &&
-          other.rva + virtualExtent(other) > rva,
+        (other) => other !== section && intersectsInterval(other, rva, size),
       )
     )
       peFailure(`${subject} interval intersects overlapping virtual sections.`);
