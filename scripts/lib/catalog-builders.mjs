@@ -234,15 +234,14 @@ export const providerCatalog = (sources) => {
       contracts:
         sources.binaryDiagnosticsContracts.BINARY_DIAGNOSTICS_TOOL_CONTRACTS.filter(
           ({ name }) =>
-            name !== "inspect_pe_resources" &&
-            name !== "inspect_binary_imports",
+            name !== "inspect_pe_resources" && name !== "inspect_pe_imports",
         ),
     },
     {
-      identity: sources.artifactProviders.BINARY_IMPORTS_PROVIDER,
+      identity: sources.artifactProviders.PE_IMPORTS_PROVIDER,
       contracts:
         sources.binaryDiagnosticsContracts.BINARY_DIAGNOSTICS_TOOL_CONTRACTS.filter(
-          ({ name }) => name === "inspect_binary_imports",
+          ({ name }) => name === "inspect_pe_imports",
         ),
     },
     {

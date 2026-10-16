@@ -2,7 +2,7 @@ import { ArtifactReaderFailure } from "../../artifacts/ArtifactReader.js";
 import { readStableArtifact } from "../../artifacts/readStableArtifact.js";
 import { ArtifactResourceScope } from "../../artifacts/ArtifactResourceScope.js";
 import { analysisErrorWithCleanupFailure } from "../../domain/analysisErrorCleanup.js";
-import type { BinaryImportsPort } from "../../application/binaryDiagnostics/BinaryImportsPort.js";
+import type { PeImportsPort } from "../../application/binaryDiagnostics/PeImportsPort.js";
 import type { ExecutionOptions } from "../../application/AnalysisProvider.js";
 import { ArtifactOperationError } from "../../domain/artifactOperationError.js";
 import {
@@ -12,36 +12,36 @@ import {
   AnalysisInputError,
   AnalysisResourceConstraintError,
 } from "../../domain/analysisErrorCore.js";
-import type { InspectBinaryImportsInput } from "../../domain/native/binaryImports.js";
+import type { InspectPeImportsInput } from "../../domain/native/peImports.js";
 import { err, ok } from "../../domain/result.js";
 import { ProviderCleanupError } from "../../domain/providerCleanupError.js";
-import { BINARY_IMPORTS_PROVIDER } from "../../application/InvestigationProviders.js";
+import { PE_IMPORTS_PROVIDER } from "../../application/InvestigationProviders.js";
 import {
   analysePeImports,
-  BINARY_IMPORTS_OUTPUT_BYTES,
+  PE_IMPORTS_OUTPUT_BYTES,
   PeOutputExceeded,
 } from "./PeImportAnalysis.js";
 import { PeWorkExhausted } from "./PeImportTables.js";
 
-const OPERATION = "inspect_binary_imports";
+const OPERATION = "inspect_pe_imports";
 /** One bounded, identity-checked read of the image (matches inspect_pe_resources' default). */
-export const BINARY_IMPORTS_MAX_FILE_BYTES = 64 * 1024 * 1024;
+export const PE_IMPORTS_MAX_FILE_BYTES = 64 * 1024 * 1024;
 
 /** In-process import scanner over one bounded, identity-checked regular file. */
-export class BinaryImportsProvider implements BinaryImportsPort {
-  readonly identity = BINARY_IMPORTS_PROVIDER;
+export class PeImportsProvider implements PeImportsPort {
+  readonly identity = PE_IMPORTS_PROVIDER;
   readonly #resources = new ArtifactResourceScope();
 
   close(): Promise<void> {
     return this.#resources.close();
   }
 
-  async inspect(input: InspectBinaryImportsInput, options?: ExecutionOptions) {
+  async inspect(input: InspectPeImportsInput, options?: ExecutionOptions) {
     try {
       const snapshot = await this.#resources.run(() =>
         readStableArtifact(
           input.path,
-          BINARY_IMPORTS_MAX_FILE_BYTES,
+          PE_IMPORTS_MAX_FILE_BYTES,
           options?.signal,
           undefined,
           this.#resources,
@@ -63,14 +63,14 @@ export class BinaryImportsProvider implements BinaryImportsPort {
         ),
       );
     } catch (cause) {
-      return err(binaryImportsFailure(cause, input, options?.signal));
+      return err(peImportsFailure(cause, input, options?.signal));
     }
   }
 }
 
 const primaryFailure = (
   cause: unknown,
-  input: InspectBinaryImportsInput,
+  input: InspectPeImportsInput,
   signal: AbortSignal | undefined,
 ) => {
   if (cause instanceof ArtifactReaderFailure && cause.reason === "integrity")
@@ -98,7 +98,7 @@ const primaryFailure = (
       OPERATION,
       "capacity",
       cause.message,
-      { max_output_bytes: BINARY_IMPORTS_OUTPUT_BYTES },
+      { max_output_bytes: PE_IMPORTS_OUTPUT_BYTES },
       {
         cause,
         remediationAction:
@@ -111,7 +111,7 @@ const primaryFailure = (
         OPERATION,
         "memory",
         cause.message,
-        { max_file_bytes: BINARY_IMPORTS_MAX_FILE_BYTES },
+        { max_file_bytes: PE_IMPORTS_MAX_FILE_BYTES },
         { cause },
       );
     if (cause.reason === "path" || cause.reason === "format")
@@ -142,16 +142,16 @@ const primaryFailure = (
   );
 };
 
-const binaryImportsFailure = (
+const peImportsFailure = (
   cause: unknown,
-  input: InspectBinaryImportsInput,
+  input: InspectPeImportsInput,
   signal: AbortSignal | undefined,
 ) => {
   const primary = primaryFailure(cause, input, signal);
   if (!(cause instanceof ArtifactReaderFailure) || cause.cleanup === undefined)
     return primary;
   const cleanup = new ProviderCleanupError(
-    BINARY_IMPORTS_PROVIDER.id,
+    PE_IMPORTS_PROVIDER.id,
     cause.cleanup.resources,
     { reason: cause.cleanup.reason },
     { operation: OPERATION, cause },

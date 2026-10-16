@@ -50,9 +50,9 @@ export const PE_RESOURCES_PROVIDER = Object.freeze({
 } as const);
 
 /** Provider identity for REA's in-process PE import/export scanner. */
-export const BINARY_IMPORTS_PROVIDER = Object.freeze({
-  id: "rea-binary-imports",
-  name: "REA binary import scanner",
+export const PE_IMPORTS_PROVIDER = Object.freeze({
+  id: "rea-pe-imports",
+  name: "REA PE import scanner",
   version: "1",
 } as const);
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Real-toolchain lane for inspect_binary_imports. mingw-w64 builds x86 and x64
+ * Real-toolchain lane for inspect_pe_imports. mingw-w64 builds x86 and x64
  * PE fixtures with known imports (by name, by ordinal from a NONAME import
  * library, delay-load), a DLL with named, ordinal-only and forwarded exports,
  * and a runtime-resolution sample. Every import, delay import, export and the
@@ -34,7 +34,7 @@ const require = async (command, args, purpose) => {
     return command;
   } catch (cause) {
     throw new Error(
-      `verify:binary-imports needs ${command} on PATH (${purpose}); it is only a fixture producer or oracle, not a REA runtime dependency.`,
+      `verify:pe-imports needs ${command} on PATH (${purpose}); it is only a fixture producer or oracle, not a REA runtime dependency.`,
       { cause },
     );
   }
@@ -49,7 +49,7 @@ const firstAvailable = async (candidates, args, purpose) => {
       // try the next candidate
     }
   throw new Error(
-    `verify:binary-imports needs one of ${candidates.join(", ")} on PATH (${purpose}).`,
+    `verify:pe-imports needs one of ${candidates.join(", ")} on PATH (${purpose}).`,
   );
 };
 
@@ -77,8 +77,8 @@ const readobj = await firstAvailable(
 await require(python, ["-I", "-c", "import pefile"], "pefile import oracle");
 
 const run = createVerifierRun();
-const workspace = await mkdtemp(join(tmpdir(), "rea-binary-imports-verifier-"));
-const client = new Client({ name: "binary-imports-verifier", version: "1" });
+const workspace = await mkdtemp(join(tmpdir(), "rea-pe-imports-verifier-"));
+const client = new Client({ name: "pe-imports-verifier", version: "1" });
 const transport = new StdioClientTransport({
   command: process.execPath,
   args: [entrypoint, "mcp"],
@@ -126,7 +126,7 @@ const inspectCli = async (path, extra = []) => {
       (
         await execute(
           process.execPath,
-          [entrypoint, "inspect-binary-imports", path, "--json", ...extra],
+          [entrypoint, "inspect-pe-imports", path, "--json", ...extra],
           { env: environment, timeout: 120_000, maxBuffer: 64 * 1024 * 1024 },
         )
       ).stdout,
@@ -151,7 +151,7 @@ const at = (name) => join(workspace, name);
 try {
   await client.connect(transport);
   const advertised = (await client.listTools()).tools.find(
-    ({ name }) => name === "inspect_binary_imports",
+    ({ name }) => name === "inspect_pe_imports",
   );
   assert.ok(advertised?.outputSchema, "tool must advertise an output schema");
   const ajv = new Ajv2020({ strict: false, validateFormats: false });
@@ -165,7 +165,7 @@ try {
   const inspectBoth = async (path) => {
     const cli = parseEvidence(await inspectCli(path, ["--detail", "imports"]));
     const reply = await client.callTool({
-      name: "inspect_binary_imports",
+      name: "inspect_pe_imports",
       arguments: { path, detail: "imports" },
     });
     assert.notEqual(reply.isError, true, mcpTextValue(reply));

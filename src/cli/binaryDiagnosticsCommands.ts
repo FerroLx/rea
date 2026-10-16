@@ -3,7 +3,7 @@ import {
   createRecordedCrashService,
   createBinaryLayoutService,
   createPeResourcesService,
-  createBinaryImportsService,
+  createPeImportsService,
 } from "../composition/binaryDiagnostics.js";
 import { CLI_COMMANDS } from "../cliCommandNames.js";
 import { logCliCommand } from "../cliLogging.js";
@@ -53,7 +53,7 @@ export const registerBinaryDiagnosticsCommands = (
         );
       }),
   });
-  cli.command(CLI_COMMANDS.inspectBinaryImports, {
+  cli.command(CLI_COMMANDS.inspectPeImports, {
     description:
       "Triage a PE image's imports: ATT&CK-tagged capabilities, imphash, runtime-resolution hints and packing facts",
     args: z.object({
@@ -71,10 +71,10 @@ export const registerBinaryDiagnosticsCommands = (
     }),
     run: ({ args, options }) =>
       withCommandCancellation(async (signal) => {
-        const imports = createBinaryImportsService();
+        const imports = createPeImportsService();
         return await logCliCommand(
           logger,
-          CLI_COMMANDS.inspectBinaryImports,
+          CLI_COMMANDS.inspectPeImports,
           async () =>
             finishAnalysisCommand(
               () =>
@@ -96,8 +96,8 @@ export const registerBinaryDiagnosticsCommands = (
                   { signal },
                 ),
               imports,
-              "rea-binary-imports",
-              "inspect_binary_imports",
+              "rea-pe-imports",
+              "inspect_pe_imports",
             ),
         );
       }),

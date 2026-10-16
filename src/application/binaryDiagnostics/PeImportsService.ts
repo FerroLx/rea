@@ -1,6 +1,6 @@
 import { isAbsolute } from "node:path";
 import type { ExecutionOptions } from "../AnalysisProvider.js";
-import type { BinaryImportsPort } from "./BinaryImportsPort.js";
+import type { PeImportsPort } from "./PeImportsPort.js";
 import type { AnalysisError } from "../../domain/analysisErrorBase.js";
 import {
   AnalysisCancelledError,
@@ -9,9 +9,9 @@ import {
 } from "../../domain/analysisErrorCore.js";
 import { createEvidence, type Evidence } from "../../domain/evidence.js";
 import {
-  binaryImportsResultSchema,
-  inspectBinaryImportsInputSchema,
-} from "../../domain/native/binaryImports.js";
+  peImportsResultSchema,
+  inspectPeImportsInputSchema,
+} from "../../domain/native/peImports.js";
 import {
   DEFAULT_IMPORT_CATEGORIES,
   OPT_IN_IMPORT_CATEGORIES,
@@ -20,15 +20,15 @@ import { analysisInputErrorFromIssues } from "../../domain/inputIssueProjection.
 import { err, type Result } from "../../domain/result.js";
 import { completeProviderEvidence } from "../ProviderOperationExecution.js";
 
-const OPERATION = "inspect_binary_imports";
+const OPERATION = "inspect_pe_imports";
 const KNOWN_CATEGORIES = new Set([
   ...DEFAULT_IMPORT_CATEGORIES,
   ...OPT_IN_IMPORT_CATEGORIES,
 ]);
 
 /** Shared caller validation, output checks and Evidence provenance for CLI/MCP. */
-export class BinaryImportsService {
-  constructor(readonly provider: BinaryImportsPort) {}
+export class PeImportsService {
+  constructor(readonly provider: PeImportsPort) {}
 
   close(): Promise<void> {
     return this.provider.close?.() ?? Promise.resolve();
@@ -40,7 +40,7 @@ export class BinaryImportsService {
   ): Promise<Result<Evidence, AnalysisError>> {
     if (options?.signal?.aborted)
       return err(new AnalysisCancelledError(OPERATION));
-    const input = inspectBinaryImportsInputSchema.safeParse(rawInput);
+    const input = inspectPeImportsInputSchema.safeParse(rawInput);
     if (!input.success)
       return err(
         analysisInputErrorFromIssues(OPERATION, input.error.issues, rawInput, {
@@ -72,7 +72,7 @@ export class BinaryImportsService {
       );
     const result = await this.provider.inspect(input.data, options);
     if (!result.ok) return result;
-    const report = binaryImportsResultSchema.safeParse(result.value);
+    const report = peImportsResultSchema.safeParse(result.value);
     const wantsDetail = input.data.detail === "imports";
     if (
       !report.success ||

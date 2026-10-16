@@ -213,18 +213,18 @@ regular files only and rejects symbolic links.
 
 ## PE import triage
 
-`inspect_binary_imports` / `inspect-binary-imports` answers "what can this
+`inspect_pe_imports` / `inspect-pe-imports` answers "what can this
 Windows PE image do?" from its import, delay-load import and export tables,
 without executing it, opening a disassembler or installing an engine:
 
 ```sh
-rea inspect-binary-imports ./sample.exe --json
-rea inspect-binary-imports ./library.dll --detail imports --json
+rea inspect-pe-imports ./sample.exe --json
+rea inspect-pe-imports ./library.dll --detail imports --json
 ```
 
 ```json
 {
-  "name": "inspect_binary_imports",
+  "name": "inspect_pe_imports",
   "arguments": { "path": "/artifacts/sample.exe" }
 }
 ```
@@ -280,6 +280,6 @@ parser discards a damaged table, REA still reports the imports it can read,
 while `imphash` stays pefile's. ELF and Mach-O are not yet
 supported.
 
-`npm run verify:binary-imports` builds x86 and x64 mingw-w64 fixtures and
+`npm run verify:pe-imports` builds x86 and x64 mingw-w64 fixtures and
 compares every import, delay import, export, ordinal resolution and the import
 hash with pefile, and the DLL set with llvm-readobj, through both CLI and MCP.

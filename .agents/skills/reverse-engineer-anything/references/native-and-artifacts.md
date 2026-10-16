@@ -262,8 +262,8 @@ Use `annotate_native_function` for one function name and/or entry comments, with
 
 ## Offline PE import triage
 
-Use `inspect_binary_imports` with an absolute `path`, or
-`rea inspect-binary-imports ./sample.exe --json`, to triage a PE image's
+Use `inspect_pe_imports` with an absolute `path`, or
+`rea inspect-pe-imports ./sample.exe --json`, to triage a PE image's
 behaviour from its import, delay-import and export tables without opening a
 native target. Weigh `capabilities` by tier: `strong` APIs are rarely imported
 without the behaviour, `weak` ones are everyday imports, and

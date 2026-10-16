@@ -3,7 +3,7 @@ import { z } from "zod";
 import { localPathStringSchema } from "../localPath.js";
 
 /**
- * `inspect_binary_imports`: static import/export facts of a local executable,
+ * `inspect_pe_imports`: static import/export facts of a local executable,
  * grouped into behaviour categories with ATT&CK technique IDs and confidence
  * tiers, plus runtime-resolution hints and packing indicators. Facts for an
  * automated triage step; never a verdict. PE today, ELF later.
@@ -12,7 +12,7 @@ import { localPathStringSchema } from "../localPath.js";
 const uint = z.number().int().nonnegative();
 const digest = z.string().regex(/^[0-9a-f]{64}$/);
 
-export const inspectBinaryImportsInputSchema = z.strictObject({
+export const inspectPeImportsInputSchema = z.strictObject({
   path: localPathStringSchema.describe(
     "Absolute filesystem path to a PE image (.exe, .dll, .sys)",
   ),
@@ -30,9 +30,7 @@ export const inspectBinaryImportsInputSchema = z.strictObject({
       'Default "summary"; "imports" also returns the full import and export tables',
     ),
 });
-export type InspectBinaryImportsInput = z.infer<
-  typeof inspectBinaryImportsInputSchema
->;
+export type InspectPeImportsInput = z.infer<typeof inspectPeImportsInputSchema>;
 
 const confidence = z.enum(["strong", "medium", "weak"]);
 
@@ -87,7 +85,7 @@ const exportEntry = z.discriminatedUnion("kind", [
   }),
 ]);
 
-export const binaryImportsResultSchema = z.strictObject({
+export const peImportsResultSchema = z.strictObject({
   artifact: z.strictObject({
     path: z.string().min(1),
     sha256: digest,
@@ -206,9 +204,9 @@ export const binaryImportsResultSchema = z.strictObject({
   runtime_execution: z.literal("not-performed"),
   limitations: z.array(z.string()),
 });
-export type BinaryImportsResult = z.infer<typeof binaryImportsResultSchema>;
+export type PeImportsResult = z.infer<typeof peImportsResultSchema>;
 
-export const BINARY_IMPORTS_LIMITATIONS: readonly string[] = [
+export const PE_IMPORTS_LIMITATIONS: readonly string[] = [
   "Static import-table facts only: no code executes and no instruction is analysed. Capabilities mean the binary imports APIs consistent with a behaviour, not that it performs it.",
   "Confidence tiers weigh signals: weak APIs are imported by ordinary software and the C runtime; argument_dependent APIs depend on arguments static analysis cannot see.",
   "APIs resolved at runtime (GetProcAddress, hashing, syscalls) are not imports; api_strings is a weak, separate hint, and obfuscated names are not found.",

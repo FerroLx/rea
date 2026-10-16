@@ -180,7 +180,7 @@
     "verify:legacy-simulator": "npm run build:cached && node scripts/verify/apple/legacy-simulator.mjs",
     "verify:architecture-guards": "node scripts/verify/architecture-guards.mjs",
     "verify:apktool": "npm run build:cached && node scripts/verify-apktool.mjs",
-    "verify:binary-imports": "npm run build:cached && node scripts/verify-binary-imports.mjs",
+    "verify:pe-imports": "npm run build:cached && node scripts/verify-pe-imports.mjs",
     "verify:pcap": "npm run build:cached && node scripts/verify-pcap.mjs",
     "verify:flutter": "npm run build:cached && node scripts/verify-flutter.mjs",
     "verify:adb": "npm run build:cached && node scripts/verify-adb.mjs",

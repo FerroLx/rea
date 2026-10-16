@@ -1,18 +1,19 @@
-name: Real binary imports
+name: Real PE imports
 
 on:
   workflow_dispatch:
   pull_request:
     paths:
-      - ".github/workflows/real-binary-imports.yml"
+      - ".github/workflows/real-pe-imports.yml"
       - "src/native/pe/**"
       - "src/domain/native/binaryImport*.ts"
+      - "src/domain/native/peImports.ts"
       - "src/domain/native/peOrdinalNames.ts"
-      - "src/application/binaryDiagnostics/BinaryImports*.ts"
+      - "src/application/binaryDiagnostics/PeImports*.ts"
       - "src/contracts/native/binaryDiagnosticsToolContracts.ts"
       - "src/composition/binaryDiagnostics.ts"
       - "src/cli/binaryDiagnosticsCommands.ts"
-      - "src/server/registerBinaryImportsTool.ts"
+      - "src/server/registerPeImportsTool.ts"
       - "src/server/createServer.ts"
       - "src/cli.ts"
       - "src/cliCommandNames.ts"
@@ -20,7 +21,7 @@ on:
       - "src/contracts/toolEffects.ts"
       - "src/artifacts/readStableArtifact*.ts"
       - "src/artifacts/ArtifactReader.ts"
-      - "scripts/verify-binary-imports.mjs"
+      - "scripts/verify-pe-imports.mjs"
       - "scripts/lib/mcp-verifier-results.mjs"
       - "scripts/rea.mjs"
       - "package.json"
@@ -31,7 +32,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: real-binary-imports-${{ github.event.pull_request.number || github.ref }}
+  group: real-pe-imports-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -39,7 +40,7 @@ env:
   HUSKY: "0"
 
 jobs:
-  real-binary-imports:
+  real-pe-imports:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -63,4 +64,4 @@ jobs:
           echo "REA_VERIFY_PEFILE_PYTHON=${oracle_python_root}/bin/python" >> "${GITHUB_ENV}"
       - run: npm ci
       - name: Verify mingw-w64 PE fixtures against pefile and llvm-readobj through CLI and MCP
-        run: npm run verify:binary-imports
+        run: npm run verify:pe-imports

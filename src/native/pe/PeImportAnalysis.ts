@@ -1,9 +1,9 @@
 import { setImmediate } from "node:timers/promises";
 
 import {
-  BINARY_IMPORTS_LIMITATIONS,
-  type BinaryImportsResult,
-} from "../../domain/native/binaryImports.js";
+  PE_IMPORTS_LIMITATIONS,
+  type PeImportsResult,
+} from "../../domain/native/peImports.js";
 import {
   BINARY_IMPORT_TAXONOMY_VERSION,
   DEFAULT_IMPORT_CATEGORIES,
@@ -34,7 +34,7 @@ const STRING_SAMPLE = 8;
 const MIN_API_STRING = 6;
 const MAX_API_STRING = 64;
 /** Inline output ceiling; detail past it is refused, not truncated. */
-export const BINARY_IMPORTS_OUTPUT_BYTES = 8 * 1024 * 1024;
+export const PE_IMPORTS_OUTPUT_BYTES = 8 * 1024 * 1024;
 /** Projected serialized bytes per detail symbol, before its strings (JSON-escaped at most 2x). */
 const DETAIL_SYMBOL_BYTES = 96;
 
@@ -42,7 +42,7 @@ const DETAIL_SYMBOL_BYTES = 96;
 export class PeOutputExceeded extends Error {
   constructor(readonly projectedBytes: number) {
     super(
-      `The import/export detail would serialise to more than ${String(BINARY_IMPORTS_OUTPUT_BYTES)} bytes.`,
+      `The import/export detail would serialise to more than ${String(PE_IMPORTS_OUTPUT_BYTES)} bytes.`,
     );
     this.name = "PeOutputExceeded";
   }
@@ -115,7 +115,7 @@ const entropy = async (
 interface CapabilityAccumulator {
   attack: readonly string[];
   total: number;
-  apis: BinaryImportsResult["capabilities"][number]["apis"];
+  apis: PeImportsResult["capabilities"][number]["apis"];
 }
 
 /**
@@ -128,9 +128,9 @@ const scanApiStrings = async (
   layout: PeImageLayout,
   excluded: ReadonlySet<string>,
   work: PeWork,
-): Promise<BinaryImportsResult["runtime_resolution"]["api_strings"]> => {
+): Promise<PeImportsResult["runtime_resolution"]["api_strings"]> => {
   let count = 0;
-  const sample: BinaryImportsResult["runtime_resolution"]["api_strings"]["sample"] =
+  const sample: PeImportsResult["runtime_resolution"]["api_strings"]["sample"] =
     [];
   const seen = new Set<string>();
   /** Report a taxonomy name; false when `api` is not one. */
@@ -229,13 +229,13 @@ const scanApiStrings = async (
  */
 export const analysePeImports = async (
   bytes: Buffer,
-  artifact: BinaryImportsResult["artifact"],
+  artifact: PeImportsResult["artifact"],
   options: {
     readonly categories: readonly string[] | undefined;
     readonly detail: boolean;
     readonly signal: AbortSignal | undefined;
   },
-): Promise<BinaryImportsResult> => {
+): Promise<PeImportsResult> => {
   const layout = readPeImageLayout(bytes);
   const work = peWork(bytes.length, options.signal);
   const categories = new Set(options.categories ?? DEFAULT_IMPORT_CATEGORIES);
@@ -307,8 +307,7 @@ export const analysePeImports = async (
   let lastDll: string | null = null;
   let lastKey = "";
   const walkLimitations: string[] = [];
-  const detailImports: NonNullable<BinaryImportsResult["detail"]>["imports"] =
-    [];
+  const detailImports: NonNullable<PeImportsResult["detail"]>["imports"] = [];
   // Detail size is projected while it is collected and refused past the
   // output budget, before the report exists.
   let detailBytes = 0;
@@ -356,7 +355,7 @@ export const analysePeImports = async (
       if (options.detail) {
         detailBytes +=
           DETAIL_SYMBOL_BYTES + 2 * (name?.length ?? 0) + 2 * dll.length;
-        if (detailBytes > BINARY_IMPORTS_OUTPUT_BYTES)
+        if (detailBytes > PE_IMPORTS_OUTPUT_BYTES)
           throw new PeOutputExceeded(detailBytes);
         if (visit.descriptor !== lastDescriptor) {
           detailImports.push({ dll, table, symbols: [] });
@@ -401,7 +400,7 @@ export const analysePeImports = async (
         DETAIL_SYMBOL_BYTES +
         2 * (visit.name?.length ?? 0) +
         (visit.kind === "forwarder" ? 2 * (visit.target?.length ?? 0) : 0);
-      if (detailBytes > BINARY_IMPORTS_OUTPUT_BYTES)
+      if (detailBytes > PE_IMPORTS_OUTPUT_BYTES)
         throw new PeOutputExceeded(detailBytes);
       exportEntries.push(visit);
     }
@@ -458,7 +457,7 @@ export const analysePeImports = async (
   const orderedDlls = [...dlls.entries()].sort(
     (a, b) => a[1].order - b[1].order,
   );
-  const result: BinaryImportsResult = {
+  const result: PeImportsResult = {
     artifact,
     format: {
       kind: "pe",
@@ -554,7 +553,7 @@ export const analysePeImports = async (
         }
       : null,
     runtime_execution: "not-performed",
-    limitations: [...BINARY_IMPORTS_LIMITATIONS, ...walkLimitations],
+    limitations: [...PE_IMPORTS_LIMITATIONS, ...walkLimitations],
   };
   return result;
 };

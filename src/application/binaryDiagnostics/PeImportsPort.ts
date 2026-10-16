@@ -4,17 +4,17 @@ import type {
 } from "../AnalysisProvider.js";
 import type { AnalysisError } from "../../domain/analysisErrorBase.js";
 import type {
-  BinaryImportsResult,
-  InspectBinaryImportsInput,
-} from "../../domain/native/binaryImports.js";
+  PeImportsResult,
+  InspectPeImportsInput,
+} from "../../domain/native/peImports.js";
 import type { Result } from "../../domain/result.js";
 
 /** Stable read and import-table decoding, independent of any disassembler. */
-export interface BinaryImportsPort {
+export interface PeImportsPort {
   readonly identity: ProviderIdentity;
   close?(): Promise<void>;
   inspect(
-    input: InspectBinaryImportsInput,
+    input: InspectPeImportsInput,
     options?: ExecutionOptions,
-  ): Promise<Result<BinaryImportsResult, AnalysisError>>;
+  ): Promise<Result<PeImportsResult, AnalysisError>>;
 }

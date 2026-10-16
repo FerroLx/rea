@@ -197,7 +197,7 @@ explicit path or endpoint and do not need it.
   only when core-only mapping candidates help; see the
   [recorded crash guide](https://github.com/morluto/rea/blob/main/docs/recorded-crashes.md).
 - What a Windows PE (.exe, .dll, .sys) can do, before any disassembly:
-  `inspect_binary_imports` with an explicit path. Returns ATT&CK-tagged
+  `inspect_pe_imports` with an explicit path. Returns ATT&CK-tagged
   capability categories with strong/medium/weak tiers, pefile-identical
   imphash, runtime-resolution hints and packing facts in a few KB; add
   `detail: "imports"` only when the full tables are needed. Capabilities are

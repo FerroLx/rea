@@ -10,11 +10,11 @@ import { registerWasmTools } from "./registerWasmTools.js";
 import { snapshotEnvironment } from "../process/snapshotEnvironment.js";
 import { captureProviderEnvironment } from "./providerEnvironment.js";
 import {
-  createBinaryImportsService,
+  createPeImportsService,
   createPeResourcesService,
 } from "../composition/binaryDiagnostics.js";
-import type { BinaryImportsService } from "../application/binaryDiagnostics/BinaryImportsService.js";
-import { registerBinaryImportsTool } from "./registerBinaryImportsTool.js";
+import type { PeImportsService } from "../application/binaryDiagnostics/PeImportsService.js";
+import { registerPeImportsTool } from "./registerPeImportsTool.js";
 import type { PeResourcesService } from "../application/binaryDiagnostics/PeResourcesService.js";
 import { registerPeResourcesTool } from "./registerPeResourcesTool.js";
 import type { EvmInterfaceService } from "../application/evm/EvmInterfaceService.js";
@@ -317,7 +317,7 @@ export const createServer = (
   const goBinary = options.goBinary ?? createGoBinaryService();
   const rustBinary = options.rustBinary ?? createRustBinaryService();
   const peResources = createPeResourcesService();
-  const binaryImports = createBinaryImportsService();
+  const peImports = createPeImportsService();
   const webNetworkCapture =
     options.webNetworkCapture ?? createWebNetworkCaptureService(environment);
   const javascriptRecovery =
@@ -400,7 +400,7 @@ export const createServer = (
       goBinary.close(),
       rustBinary.close(),
       peResources.close(),
-      binaryImports.close(),
+      peImports.close(),
       webNetworkCapture.close(),
       javascriptRecovery.close?.() ?? Promise.resolve(),
       ...(options.optionalObservationProviderOwner === "caller"
@@ -459,7 +459,7 @@ export const createServer = (
     goBinary,
     rustBinary,
     peResources,
-    binaryImports,
+    peImports,
     webNetworkCapture,
   };
   registerBinaryAnalysisTools(toolContext);
@@ -659,7 +659,7 @@ const registerConfiguredAnalysisTools = (
     goBinary,
     rustBinary,
     peResources,
-    binaryImports,
+    peImports,
     webNetworkCapture,
   }: ServerToolContext,
   android: AndroidAnalysisPort,
@@ -706,9 +706,9 @@ const registerConfiguredAnalysisTools = (
     recordEvidence,
     withAdmittedAnalysis,
   );
-  registerBinaryImportsTool(
+  registerPeImportsTool(
     server,
-    binaryImports,
+    peImports,
     toolLogger,
     recordEvidence,
     withAdmittedAnalysis,
@@ -835,7 +835,7 @@ interface ServerToolContext extends ReturnType<typeof createSessionRecorders> {
   readonly goBinary: GoBinaryService;
   readonly rustBinary: RustBinaryService;
   readonly peResources: PeResourcesService;
-  readonly binaryImports: BinaryImportsService;
+  readonly peImports: PeImportsService;
   readonly webNetworkCapture: WebNetworkCaptureService;
   readonly artifactResources: ArtifactResourceScope;
   readonly server: EvidenceMcpServer;
