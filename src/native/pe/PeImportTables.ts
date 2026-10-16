@@ -142,10 +142,10 @@ export const walkImports = async (
     return facts;
   }
   const size = DESCRIPTOR_SIZE[table];
-  // Capped by the directory size when declared, the bytes available and the
-  // all-zero terminator, whichever comes first.
-  const declared = directory.size > 0 ? directory.size : span.length;
-  const maxDescriptors = Math.floor(Math.min(declared, span.length) / size);
+  // The loader (and pefile) ignore the directory's Size and read descriptors
+  // up to the all-zero terminator, so only the mapped bytes and the work budget
+  // bound the walk: a small declared Size must not hide imports that load.
+  const maxDescriptors = Math.floor(span.length / size);
   const thunkWidth = layout.format === "pe32-plus" ? 8 : 4;
   for (let index = 0; index < maxDescriptors; index++) {
     charge(work, 1);
@@ -245,7 +245,11 @@ export type PeExportVisit =
 export interface PeExportWalkFacts {
   readonly present: boolean;
   readonly dllName: string | null;
+  /** Function slots examined. */
   readonly functions: number;
+  /** Exported entries visited: one per name, plus each unnamed used slot. */
+  readonly entries: number;
+  /** Visited entries carrying a name (several names may share one slot). */
   readonly named: number;
   readonly forwarders: number;
   readonly unreadable: number;
@@ -266,6 +270,7 @@ export const walkExports = async (
     present: false,
     dllName: null,
     functions: 0,
+    entries: 0,
     named: 0,
     forwarders: 0,
     unreadable: 0,
@@ -294,8 +299,9 @@ export const walkExports = async (
   );
   let unreadable =
     (functions < functionCount ? 1 : 0) + (names < nameCount ? 1 : 0);
-  // Name index per function slot; a sparse map bounded by `names`.
-  const nameOf = new Map<number, number>();
+  // Name indices per function slot; a sparse map bounded by `names`. Several
+  // names may alias one slot, and each is a separate export (as in pefile).
+  const nameOf = new Map<number, number[]>();
   for (let i = 0; i < names; i++) {
     charge(work, 1);
     await step(work);
@@ -304,42 +310,46 @@ export const walkExports = async (
       unreadable += 1;
       continue;
     }
-    if (!nameOf.has(slot)) nameOf.set(slot, i);
+    const aliases = nameOf.get(slot);
+    if (aliases === undefined) nameOf.set(slot, [i]);
+    else aliases.push(i);
   }
   const exportEnd = directory.rva + directory.size;
   let forwarders = 0;
+  let entries = 0;
+  let named = 0;
   for (let slot = 0; slot < functions; slot++) {
     charge(work, 1);
     await step(work);
     const rva = bytes.readUInt32LE((functionsSpan?.offset ?? 0) + slot * 4);
     if (rva === 0) continue; // an unused ordinal slot
-    const nameIndex = nameOf.get(slot);
-    const name =
-      nameIndex === undefined
-        ? null
-        : readName(
-            bytes,
-            layout,
-            bytes.readUInt32LE((namesSpan?.offset ?? 0) + nameIndex * 4),
-            work,
-          );
     const ordinal = base + slot;
     // An RVA inside the export directory is a forwarder string, not code.
-    if (rva >= directory.rva && rva < exportEnd) {
-      forwarders += 1;
-      visit({
-        kind: "forwarder",
-        ordinal,
-        name,
-        target: readName(bytes, layout, rva, work),
-      });
-    } else visit({ kind: "function", ordinal, name, rva });
+    const forwarded = rva >= directory.rva && rva < exportEnd;
+    const target = forwarded ? readName(bytes, layout, rva, work) : null;
+    if (forwarded) forwarders += 1;
+    for (const nameIndex of nameOf.get(slot) ?? [null]) {
+      const name =
+        nameIndex === null
+          ? null
+          : readName(
+              bytes,
+              layout,
+              bytes.readUInt32LE((namesSpan?.offset ?? 0) + nameIndex * 4),
+              work,
+            );
+      entries += 1;
+      if (name !== null) named += 1;
+      if (forwarded) visit({ kind: "forwarder", ordinal, name, target });
+      else visit({ kind: "function", ordinal, name, rva });
+    }
   }
   return {
     present: true,
     dllName,
     functions,
-    named: nameOf.size,
+    entries,
+    named,
     forwarders,
     unreadable,
   };

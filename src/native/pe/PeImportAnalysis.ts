@@ -90,10 +90,13 @@ const charge = (work: PeWork, units: number): void => {
   if (work.remaining < 0) throw new PeWorkExhausted(work.limit);
 };
 
-/** Shannon entropy (bits per byte) of a byte range, charged per byte. */
-const entropy = (bytes: Uint8Array, work: PeWork): number => {
+/**
+ * Shannon entropy (bits per byte) of a byte range. One linear pass over bytes
+ * that exist, so it is bounded by the file size and not charged to the
+ * table-walk budget (which guards amplification, not size).
+ */
+const entropy = (bytes: Uint8Array): number => {
   if (bytes.length === 0) return 0;
-  charge(work, bytes.length);
   const counts = new Uint32Array(256);
   for (const byte of bytes) counts[byte]! += 1;
   let total = 0;
@@ -126,30 +129,49 @@ const scanApiStrings = async (
   const sample: BinaryImportsResult["runtime_resolution"]["api_strings"]["sample"] =
     [];
   const seen = new Set<string>();
+  /** Report a taxonomy name; false when `api` is not one. */
   const report = (
     api: string,
     offset: number,
     encoding: "ascii" | "utf16le",
-  ) => {
-    if (excluded.has(api) || importTaxonomyEntry(api) === undefined) return;
+  ): boolean => {
+    if (importTaxonomyEntry(api) === undefined) return false;
+    if (excluded.has(api)) return true;
     count += 1;
     // Sample distinct APIs, so one repeated name cannot fill it.
     if (sample.length < STRING_SAMPLE && !seen.has(api)) {
       seen.add(api);
       sample.push({ api, offset, encoding });
     }
+    return true;
   };
   const isIdent = (byte: number): boolean =>
     (byte >= 0x30 && byte <= 0x39) ||
     (byte >= 0x41 && byte <= 0x5a) ||
     (byte >= 0x61 && byte <= 0x7a) ||
     byte === 0x5f;
+  /**
+   * Report a UTF-16LE run. An ASCII string's last character followed by its
+   * NUL terminator also reads as one UTF-16 unit, so a run directly after an
+   * ASCII identifier byte is retried without that absorbed first character.
+   */
+  const flushUtf16 = (chars: string, runStart: number): void => {
+    if (chars.length < MIN_API_STRING || chars.length > MAX_API_STRING) return;
+    if (report(chars, runStart, "utf16le")) return;
+    if (
+      runStart > 0 &&
+      isIdent(bytes[runStart - 1]!) &&
+      chars.length > MIN_API_STRING
+    )
+      report(chars.slice(1), runStart + 2, "utf16le");
+  };
   for (const section of layout.sections) {
     if (section.size === 0) continue;
     const start = section.offset;
     const end = section.offset + section.size;
-    // Three passes (ASCII and UTF-16LE at both alignments), charged per byte.
-    charge(work, 3 * section.size);
+    // Three linear passes (ASCII and UTF-16LE at both alignments) over bytes
+    // that exist: bounded by the file size, polled for cancellation, and not
+    // charged to the table-walk budget.
     let sinceYield = 0;
     let run = start;
     for (let at = start; at <= end; at++) {
@@ -178,13 +200,11 @@ const scanApiStrings = async (
           chars += String.fromCharCode(low);
           continue;
         }
-        if (chars.length >= MIN_API_STRING && chars.length <= MAX_API_STRING)
-          report(chars, runStart, "utf16le");
+        flushUtf16(chars, runStart);
         chars = "";
         runStart = at + 2;
       }
-      if (chars.length >= MIN_API_STRING && chars.length <= MAX_API_STRING)
-        report(chars, runStart, "utf16le");
+      flushUtf16(chars, runStart);
       await setImmediate();
       work.signal?.throwIfAborted();
     }
@@ -349,7 +369,7 @@ export const analysePeImports = async (
       exportEntries.push(visit);
     }
   });
-  counts.exports = exportFacts.functions;
+  counts.exports = exportFacts.entries;
   counts.exports_named = exportFacts.named;
   counts.forwarders = exportFacts.forwarders;
   counts.exports_unreadable = exportFacts.unreadable;
@@ -370,7 +390,6 @@ export const analysePeImports = async (
     if (section.size === 0) continue;
     const value = entropy(
       bytes.subarray(section.offset, section.offset + section.size),
-      work,
     );
     if (maxEntropy === null || value > maxEntropy.entropy)
       maxEntropy = { section: section.name, entropy: value };
@@ -389,7 +408,6 @@ export const analysePeImports = async (
               layout.overlay.offset,
               layout.overlay.offset + layout.overlay.size,
             ),
-            work,
           ),
         };
 
