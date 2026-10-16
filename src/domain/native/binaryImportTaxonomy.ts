@@ -13,7 +13,7 @@
  * with" a behaviour, never that the binary performs it.
  */
 
-export const BINARY_IMPORT_TAXONOMY_VERSION = "1.0.0";
+export const BINARY_IMPORT_TAXONOMY_VERSION = "1.0.1";
 
 export type ImportConfidence = "strong" | "medium" | "weak";
 
@@ -86,8 +86,10 @@ export const BINARY_IMPORT_TAXONOMY: readonly ImportTaxonomyEntry[] = [
     "VirtualAllocEx",
     "VirtualProtectEx",
     "NtAllocateVirtualMemory",
-    "OpenProcess",
   ]),
+  // Process monitors, debuggers and installers open other processes routinely;
+  // alone it gave 25 benign tools a medium injection signal.
+  ...e("process_injection", ["T1055"], "weak", ["OpenProcess"]),
   ...e("process_creation", ["T1106"], "weak", [
     "CreateProcessA",
     "CreateProcessW",

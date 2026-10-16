@@ -28,6 +28,13 @@ describe("binary import taxonomy", () => {
       expect(known.has(entry.category)).toBe(true);
   });
 
+  it("keeps OpenProcess alone a weak injection signal (process tools import it routinely)", () => {
+    expect(importTaxonomyEntry("OpenProcess")).toMatchObject({
+      category: "process_injection",
+      confidence: "weak",
+    });
+  });
+
   it("reports no strong capability for the Windows Go runtime's own imports", () => {
     // Every import of a stock Go 1.2x windows/amd64 binary (esbuild 0.2x).
     const goRuntime = [
