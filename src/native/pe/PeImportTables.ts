@@ -63,6 +63,7 @@ const readName = (
   layout: PeImageLayout,
   rva: number,
   work: PeWork,
+  truncate = false,
 ): string | null => {
   const span = layout.availableBytes(rva);
   if (span === null) return null;
@@ -71,8 +72,43 @@ const readName = (
   const limit = Math.min(span.length, PE_NAME_MAX_BYTES + 1);
   const length = bytes.subarray(span.offset, span.offset + limit).indexOf(0);
   charge(work, length === -1 ? limit : length + 1);
-  if (length === -1) return null;
-  return bytes.toString("latin1", span.offset, span.offset + length);
+  if (length !== -1)
+    return bytes.toString("latin1", span.offset, span.offset + length);
+  // Import names are read like pefile's get_string_at_rva: the first 512
+  // bytes when no terminator follows, so such a name cannot hide its imports.
+  return truncate
+    ? bytes.toString(
+        "latin1",
+        span.offset,
+        span.offset + Math.min(span.length, PE_NAME_MAX_BYTES),
+      )
+    : null;
+};
+
+/** pefile's `is_valid_function_name` (letters, digits and `._?@$()<>`). */
+const PEFILE_FUNCTION_NAME = /^[A-Za-z0-9._?@$()<>]*$/;
+
+/**
+ * The first of `candidates` (RVAs, 0/null = absent) that is mapped and whose
+ * first thunk is non-zero, as its file span; null when none is.
+ */
+const firstPopulatedTable = (
+  bytes: Buffer,
+  layout: PeImageLayout,
+  candidates: readonly (number | null)[],
+  thunkWidth: number,
+): { readonly offset: number; readonly length: number } | null => {
+  for (const rva of candidates) {
+    if (rva === null || rva === 0) continue;
+    const span = layout.availableBytes(rva);
+    if (span === null || span.length < thunkWidth) continue;
+    const first =
+      thunkWidth === 8
+        ? bytes.readBigUInt64LE(span.offset) !== 0n
+        : bytes.readUInt32LE(span.offset) !== 0;
+    if (first) return span;
+  }
+  return null;
 };
 
 export type PeImportedSymbol =
@@ -93,6 +129,12 @@ export interface PeImportVisit {
   readonly descriptor: number;
   readonly dll: string | null;
   readonly symbol: PeImportedSymbol;
+  /**
+   * pefile lists (and so hashes) this symbol. False for a name outside
+   * pefile's function-name charset, and for every symbol of a descriptor
+   * pefile aborts (an unreadable hint/name entry); REA still reports them.
+   */
+  readonly pefileListed: boolean;
 }
 
 export interface PeImportWalkFacts {
@@ -169,51 +211,49 @@ export const walkImports = async (
     }
     facts.descriptors += 1;
     let nameRva: number;
-    let lookupRva: number;
+    // The lookup (OriginalFirstThunk / pINT) and address (FirstThunk / pIAT)
+    // tables. Like pefile, the lookup table is used when it holds entries and
+    // the address table otherwise, so an emptied lookup table cannot hide a
+    // populated address table.
+    let candidates: readonly (number | null)[];
     if (table === "import") {
-      const originalFirstThunk = bytes.readUInt32LE(at);
       nameRva = bytes.readUInt32LE(at + 12);
-      // OriginalFirstThunk (the unbound lookup table) when present; otherwise
-      // FirstThunk, which holds the same entries until the image is bound.
-      lookupRva =
-        originalFirstThunk !== 0
-          ? originalFirstThunk
-          : bytes.readUInt32LE(at + 16);
+      candidates = [bytes.readUInt32LE(at), bytes.readUInt32LE(at + 16)];
     } else {
       const rvaBased = (bytes.readUInt32LE(at) & 1) === 1;
       const name = delayField(bytes.readUInt32LE(at + 4), rvaBased, layout);
-      const names = delayField(bytes.readUInt32LE(at + 16), rvaBased, layout);
-      if (name === null || names === null) {
+      if (name === null) {
         facts.delayVaUnmapped += 1;
         unusable += 1;
         continue;
       }
       nameRva = name;
-      lookupRva = names;
+      candidates = [
+        delayField(bytes.readUInt32LE(at + 16), rvaBased, layout),
+        delayField(bytes.readUInt32LE(at + 12), rvaBased, layout),
+      ];
     }
-    const thunks = lookupRva === 0 ? null : layout.availableBytes(lookupRva);
-    const maxThunks =
-      thunks === null ? 0 : Math.floor(thunks.length / thunkWidth);
-    const firstThunkEmpty =
-      thunks === null ||
-      maxThunks === 0 ||
-      (thunkWidth === 8
-        ? bytes.readBigUInt64LE(thunks.offset) === 0n
-        : bytes.readUInt32LE(thunks.offset) === 0);
-    // pefile counts a descriptor toward its failure limit only when its thunks
-    // yield no imports; an unreadable DLL name merely drops the descriptor.
+    const thunks = firstPopulatedTable(bytes, layout, candidates, thunkWidth);
+    // pefile counts a descriptor toward its failure limit only when it yields
+    // no imports; an unreadable DLL name merely drops the descriptor.
     // Counting names too would let planted nameless decoys end the walk early
     // and hide the descriptors pefile (and VirusTotal) still read.
-    if (thunks === null || firstThunkEmpty) {
+    if (thunks === null) {
       facts.unreadableDescriptors += 1;
       unusable += 1;
       continue;
     }
-    const dll = nameRva === 0 ? null : readName(bytes, layout, nameRva, work);
+    const maxThunks = Math.floor(thunks.length / thunkWidth);
+    const dll =
+      nameRva === 0 ? null : readName(bytes, layout, nameRva, work, true);
     if (dll === null || dll === "") {
       facts.unreadableDescriptors += 1;
       continue;
     }
+    // Buffered per descriptor: whether pefile lists any of its symbols is only
+    // known once every entry was read (one bad entry aborts the descriptor).
+    const read: { symbol: PeImportedSymbol; listed: boolean }[] = [];
+    let aborted = false;
     let terminated = false;
     for (let t = 0; t < maxThunks; t++) {
       charge(work, 1);
@@ -245,14 +285,32 @@ export const walkImports = async (
         const name =
           hintSpan === null || hintSpan.length < 3
             ? null
-            : readName(bytes, layout, hintRva + 2, work);
+            : readName(bytes, layout, hintRva + 2, work, true);
         symbol =
           hintSpan === null || name === null
             ? { kind: "unreadable", rva: hintRva }
             : { kind: "name", name, hint: bytes.readUInt16LE(hintSpan.offset) };
       }
-      visit({ table, descriptor: index, dll, symbol });
+      // pefile aborts the whole descriptor on an unreadable entry and skips a
+      // name outside its function-name charset.
+      if (symbol.kind === "unreadable") aborted = true;
+      read.push({
+        symbol,
+        listed:
+          symbol.kind === "ordinal" ||
+          (symbol.kind === "name" && PEFILE_FUNCTION_NAME.test(symbol.name)),
+      });
     }
+    const listedByPefile = !aborted && read.some(({ listed }) => listed);
+    if (!listedByPefile) unusable += 1;
+    for (const { symbol, listed } of read)
+      visit({
+        table,
+        descriptor: index,
+        dll,
+        symbol,
+        pefileListed: listed && !aborted,
+      });
     // A lookup table that runs out of section without a terminator is damaged.
     if (!terminated) facts.unreadableDescriptors += 1;
   }

@@ -309,8 +309,9 @@ export const analysePeImports = async (
         if (!symbol.resolvedFromTable) counts.ordinal_unresolved += 1;
       } else counts.unreadable += 1;
       const name = symbolName(symbol);
-      // pefile hashes the import table only, in descriptor and thunk order.
-      if (table === "import" && name !== null) {
+      // pefile hashes the import table only, in descriptor and thunk order,
+      // and only the symbols it lists.
+      if (table === "import" && name !== null && visit.pefileListed) {
         imphash.update(
           `${imphashParts === 0 ? "" : ","}${imphashLibrary(dll)}.${name.toLowerCase()}`,
         );

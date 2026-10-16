@@ -146,4 +146,29 @@ describe("PE import analysis", () => {
     // pefile 2024.8.26 on the same bytes.
     expect(report.imphash).toBe("380339ab1085cc666c191cdf275d4ade");
   });
+
+  it("falls back to FirstThunk when OriginalFirstThunk names an empty table, as pefile does", async () => {
+    const bytes = peImportFixture({ imports: [INJECTION] });
+    bytes.writeUInt32LE(0x2000 + 20, 0x400); // OFT -> the all-zero terminator
+    const report = await analyse(bytes);
+    expect(report.counts.imports).toBe(3);
+    expect(report.capabilities.map((c) => c.category)).toContain(
+      "process_injection",
+    );
+    // pefile 2024.8.26 on the same bytes.
+    expect(report.imphash).toBe("f912da22ec1b66d09c386ee92da61a68");
+  });
+
+  it("keeps a descriptor whose DLL name has no terminator within 512 bytes", async () => {
+    const report = await analyse(
+      peImportFixture({
+        imports: [
+          ["A".repeat(600), ["WriteProcessMemory", "CreateRemoteThread"]],
+        ],
+      }),
+    );
+    expect(report.counts.imports).toBe(2);
+    // pefile 2024.8.26 on the same bytes (the name truncated to 512).
+    expect(report.imphash).toBe("3597690c8ad7fbfc9f8129219ab36be3");
+  });
 });
