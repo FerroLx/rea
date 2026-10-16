@@ -301,7 +301,11 @@ Malformed tables are reported in `counts` (unreadable entries, unmapped
 delay-load addresses) instead of being guessed. As in pefile, an unusable
 import descriptor is skipped rather than ending the table, so one planted bad
 descriptor cannot hide the imports after it, and a walk stops once more than
-five descriptors have failed (stated in `limitations`). Where pefile's own
+five descriptors have failed (stated in `limitations`). A descriptor whose
+import list is empty is a loaded dependency with no imports, not a failure.
+Hybrid ARM64X, ARM64EC and x86 CHPE images are read in their native view; a
+limitation states that the second view, applied through dynamic relocations,
+is not examined. Where pefile's own
 parser discards a damaged table, REA still reports the imports it can read,
 while `imphash` stays pefile's. ELF and Mach-O are not yet
 supported.

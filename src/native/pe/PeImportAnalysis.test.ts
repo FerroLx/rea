@@ -208,4 +208,40 @@ describe("PE image layouts the loader accepts", () => {
     expect(report.counts.unreadable).toBe(0);
     expect(report.imphash).toBe(aligned.imphash);
   });
+
+  it("reports a descriptor with an empty lookup table as a dependency with no imports", async () => {
+    const report = await analyse(
+      peImportFixture({ imports: [INJECTION, ["USER32.dll", []]] }),
+    );
+    expect(report.dlls).toEqual([
+      { name: "KERNEL32.dll", imports: 3, delay: false, api_set: false },
+      { name: "USER32.dll", imports: 0, delay: false, api_set: false },
+    ]);
+    expect(report.imports.at(-1)).toEqual({ dll: "USER32.dll", symbols: [] });
+    expect(report.counts).toMatchObject({ dlls: 2, imports: 3, unreadable: 0 });
+  });
+
+  it("does not let empty import lists end the walk", async () => {
+    const empty = Array.from(
+      { length: 7 },
+      (_, i) => [`EMPTY${String(i)}.dll`, []] as const,
+    );
+    const report = await analyse(
+      peImportFixture({ imports: [...empty, INJECTION] }),
+    );
+    expect(report.counts).toMatchObject({ dlls: 8, imports: 3, unreadable: 0 });
+    expect(report.limitations.join(" ")).not.toContain("more than five");
+  });
+
+  it("states that a hybrid image's second view is not examined", async () => {
+    const hybrid = await analyse(
+      peImportFixture({ imports: [INJECTION], chpeMetadata: true }),
+    );
+    const native = await analyse(peImportFixture({ imports: [INJECTION] }));
+    expect(hybrid.limitations.filter((l) => l.includes("CHPE"))).toHaveLength(
+      1,
+    );
+    expect(native.limitations.some((l) => l.includes("CHPE"))).toBe(false);
+    expect(hybrid.imports).toEqual(native.imports);
+  });
 });

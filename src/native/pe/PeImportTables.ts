@@ -94,16 +94,21 @@ const readName = (
     : null;
 };
 
+type ThunkSpan = { readonly offset: number; readonly length: number };
+
 /**
  * The first of `candidates` (RVAs, 0/null = absent) that is mapped and whose
- * first thunk is non-zero, as its file span; null when none is.
+ * first thunk is non-zero, as its file span; `"empty"` when none is but one is
+ * mapped and starts with its terminator (an import list with no entries, as
+ * ARM64X images emit for EC-only imports); null when none is mapped.
  */
 const firstPopulatedTable = (
   bytes: Buffer,
   layout: PeImageLayout,
   candidates: readonly (number | null)[],
   thunkWidth: number,
-): { readonly offset: number; readonly length: number } | null => {
+): ThunkSpan | "empty" | null => {
+  let empty = false;
   for (const rva of candidates) {
     if (rva === null || rva === 0) continue;
     const span = layout.availableBytes(rva);
@@ -113,8 +118,9 @@ const firstPopulatedTable = (
         ? bytes.readBigUInt64LE(span.offset) !== 0n
         : bytes.readUInt32LE(span.offset) !== 0;
     if (first) return span;
+    empty = true;
   }
-  return null;
+  return empty ? "empty" : null;
 };
 
 /**
@@ -239,6 +245,13 @@ export interface PeImportVisit {
   readonly source: "lookup" | "address";
 }
 
+/** A descriptor the loader loads: its DLL is a dependency, even with no entries. */
+export interface PeImportDependency {
+  readonly table: "import" | "delay";
+  readonly descriptor: number;
+  readonly dll: string;
+}
+
 export interface PeImportWalkFacts {
   readonly descriptors: number;
   readonly unreadableDescriptors: number;
@@ -278,6 +291,8 @@ export const walkImports = async (
   table: "import" | "delay",
   work: PeWork,
   visit: (entry: PeImportVisit) => void,
+  /** Called once per loaded descriptor, before its symbols are visited. */
+  dependency: (entry: PeImportDependency) => void,
 ): Promise<PeImportWalkFacts> => {
   const directory = layout.dataDirectory(table === "import" ? 1 : 13);
   const facts = {
@@ -344,15 +359,18 @@ export const walkImports = async (
         delayField(bytes.readUInt32LE(at + 12), rvaBased, layout),
       ];
     }
-    const thunks = firstPopulatedTable(bytes, layout, candidates, thunkWidth);
-    const address =
+    const lookup = firstPopulatedTable(bytes, layout, candidates, thunkWidth);
+    const addressSpan =
       addressTable === null
         ? null
         : firstPopulatedTable(bytes, layout, [addressTable], thunkWidth);
-    // A descriptor counts toward the failure limit only when no table yields
-    // an entry; an unreadable DLL name merely drops it. Counting names too
-    // would let planted nameless decoys end the walk early.
-    if (thunks === null && address === null) {
+    const thunks = typeof lookup === "object" ? lookup : null;
+    const address = typeof addressSpan === "object" ? addressSpan : null;
+    // A descriptor counts toward the failure limit only when no table is
+    // mapped; an unreadable DLL name merely drops it. Counting names too would
+    // let planted nameless decoys end the walk early, and a mapped table that
+    // starts with its terminator is a dependency with no entries, not damage.
+    if (lookup === null && addressSpan === null) {
       facts.unreadableDescriptors += 1;
       unusable += 1;
       continue;
@@ -363,6 +381,7 @@ export const walkImports = async (
       facts.unreadableDescriptors += 1;
       continue;
     }
+    dependency({ table, descriptor: index, dll });
     if (thunks !== null) {
       const maxThunks = Math.floor(thunks.length / thunkWidth);
       let terminated = false;

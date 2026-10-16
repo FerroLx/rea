@@ -22,6 +22,8 @@ interface ImportFixture {
    * sector-rounding loader reads them); the file is padded to stay in range.
    */
   readonly rawPointer?: number;
+  /** Add a load configuration declaring CHPE metadata (a hybrid image). */
+  readonly chpeMetadata?: boolean;
 }
 
 /**
@@ -37,6 +39,7 @@ export const peImportFixture = ({
   sectionBytes = 0,
   sizeOfHeaders,
   rawPointer,
+  chpeMetadata = false,
 }: ImportFixture) => {
   const SECTION_RVA = 0x2000;
   const RAW = 0x400;
@@ -105,6 +108,14 @@ export const peImportFixture = ({
     header.writeUInt32LE(SECTION_RVA + ordinalsAt, 36);
     exportDirectory = { rva: SECTION_RVA + headerAt, size: 40 };
   }
+  let loadConfig: { rva: number; size: number } | null = null;
+  if (chpeMetadata) {
+    // IMAGE_LOAD_CONFIG_DIRECTORY32 up to CHPEMetadataPointer (offset 124).
+    const config = Buffer.alloc(128);
+    config.writeUInt32LE(config.length, 0);
+    config.writeUInt32LE(0x400000 + SECTION_RVA, 124);
+    loadConfig = { rva: SECTION_RVA + put(config), size: config.length };
+  }
   put(data, 1);
 
   const content = Buffer.concat(chunks);
@@ -140,6 +151,10 @@ export const peImportFixture = ({
       importDirectorySize ?? descriptors.length,
       directories + 12,
     );
+  }
+  if (loadConfig !== null) {
+    bytes.writeUInt32LE(loadConfig.rva, directories + 80);
+    bytes.writeUInt32LE(loadConfig.size, directories + 84);
   }
   const section = optional + 224;
   bytes.write(".idata", section, "ascii");

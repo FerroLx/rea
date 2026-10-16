@@ -132,7 +132,11 @@ export const peImportsResultSchema = z.strictObject({
   }),
   categories_scanned: z.array(z.string()),
   capabilities: z.array(capability),
-  /** DLLs in first-appearance order (up to 64); `api_set` marks api-ms-/ext-ms- names. */
+  /**
+   * Loaded DLLs in first-appearance order (up to 64); `api_set` marks
+   * api-ms-/ext-ms- names. A descriptor whose import list is empty (as ARM64X
+   * images emit for EC-only imports) is still a dependency, with 0 imports.
+   */
   dlls: z.array(
     z.strictObject({
       name: z.string(),
@@ -146,7 +150,7 @@ export const peImportsResultSchema = z.strictObject({
    * Unbound import descriptors whose FirstThunk (address) table differs from
    * the OriginalFirstThunk (lookup) table the loader binds. Compilers emit
    * identical tables, so a disagreement is crafted; its address-table entries
-   * appear in capabilities with via "address_table", not in counts or dlls.
+   * appear in capabilities with via "address_table", never in counts, dll import totals or the tables.
    */
   import_table_disagreements: z.strictObject({
     count: uint,

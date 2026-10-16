@@ -15,7 +15,9 @@ import { decodePeMachine } from "../../domain/peMachine.js";
 import { type PeImageLayout, readPeImageLayout } from "./PeImageLayout.js";
 import {
   type PeExportVisit,
+  type PeImportDependency,
   type PeImportedSymbol,
+  type PeImportVisit,
   PeWorkExhausted,
   peWork,
   type PeWork,
@@ -114,6 +116,33 @@ const entropy = async (
   }
   return Math.round(total * 1000) / 1000;
 };
+
+/** IMAGE_LOAD_CONFIG_DIRECTORY CHPEMetadataPointer offset (PE32, PE32+). */
+const CHPE_METADATA_AT = { pe32: 124, "pe32-plus": 200 } as const;
+
+/**
+ * Whether the load configuration declares CHPE metadata: an ARM64X, ARM64EC
+ * or x86 CHPE hybrid whose second (EC/x86) view is applied by dynamic
+ * relocations. Unknown or unreadable configurations count as not hybrid.
+ */
+const declaresHybridMetadata = (
+  bytes: Buffer,
+  layout: PeImageLayout,
+): boolean => {
+  const directory = layout.dataDirectory(10);
+  if (directory === null || directory.rva === 0) return false;
+  const span = layout.availableBytes(directory.rva);
+  const at = CHPE_METADATA_AT[layout.format];
+  const width = layout.format === "pe32-plus" ? 8 : 4;
+  if (span === null || span.length < at + width) return false;
+  if (bytes.readUInt32LE(span.offset) < at + width) return false;
+  return width === 8
+    ? bytes.readBigUInt64LE(span.offset + at) !== 0n
+    : bytes.readUInt32LE(span.offset + at) !== 0;
+};
+
+const HYBRID_LIMITATION =
+  "This hybrid image (ARM64X, ARM64EC or x86 CHPE) declares CHPE metadata: imports are read from its native view only. The second (ARM64EC or x86) view, which the loader applies through dynamic value relocations, is not examined, so its imports may be missing and a DLL can appear with no imports.";
 
 interface CapabilityAccumulator {
   attack: readonly string[];
@@ -305,9 +334,6 @@ export const analysePeImports = async (
     const name = symbolName(symbol);
     if (name !== null) recordCapability(name, dll, "address_table");
   };
-  // The per-DLL key is computed once per run of symbols from the same DLL.
-  let lastDll: string | null = null;
-  let lastKey = "";
   const walkLimitations: string[] = [];
   const tables: Record<"import" | "delay", PeImportsResult["imports"]> = {
     import: [],
@@ -318,9 +344,27 @@ export const analysePeImports = async (
   let tableBytes = 0;
 
   for (const table of ["import", "delay"] as const) {
-    lastDll = null; // the cached key includes the table
-    let lastDescriptor = -1;
-    const facts = await walkImports(bytes, layout, table, work, (visit) => {
+    // The loaded descriptor whose symbols are being visited.
+    let current: { name: string; imports: number } | undefined;
+    const dependency = ({ dll }: PeImportDependency): void => {
+      const key = `${table}:${dll.toLowerCase()}`;
+      current = dlls.get(key);
+      if (current === undefined) {
+        const entry = {
+          name: dll,
+          imports: 0,
+          delay: table === "delay",
+          order: dlls.size,
+        };
+        dlls.set(key, entry);
+        current = entry;
+      }
+      tableBytes += TABLE_SYMBOL_BYTES + 2 * dll.length;
+      if (tableBytes > PE_IMPORTS_OUTPUT_BYTES)
+        throw new PeOutputExceeded(tableBytes);
+      tables[table].push({ dll, symbols: [] });
+    };
+    const visitSymbol = (visit: PeImportVisit): void => {
       const dll = visit.dll ?? "";
       if (visit.source === "address") {
         // Never bound by the loader: only a disagreement fact and capability
@@ -333,20 +377,7 @@ export const analysePeImports = async (
         addressTableHit(visit.symbol, dll);
         return;
       }
-      if (dll !== lastDll) {
-        lastDll = dll;
-        lastKey = `${table}:${dll.toLowerCase()}`;
-      }
-      const key = lastKey;
-      const known = dlls.get(key);
-      if (known === undefined)
-        dlls.set(key, {
-          name: dll,
-          imports: 1,
-          delay: table === "delay",
-          order: dlls.size,
-        });
-      else known.imports += 1;
+      if (current !== undefined) current.imports += 1;
       if (table === "import") counts.imports += 1;
       else counts.delay_imports += 1;
       const { symbol } = visit;
@@ -357,14 +388,9 @@ export const analysePeImports = async (
       } else counts.unreadable += 1;
       const name = symbolName(symbol);
       if (name !== null) recordCapability(name, dll, table);
-      tableBytes +=
-        TABLE_SYMBOL_BYTES + 2 * (name?.length ?? 0) + 2 * dll.length;
+      tableBytes += TABLE_SYMBOL_BYTES + 2 * (name?.length ?? 0);
       if (tableBytes > PE_IMPORTS_OUTPUT_BYTES)
         throw new PeOutputExceeded(tableBytes);
-      if (visit.descriptor !== lastDescriptor) {
-        tables[table].push({ dll, symbols: [] });
-        lastDescriptor = visit.descriptor;
-      }
       tables[table].at(-1)!.symbols.push(
         symbol.kind === "name"
           ? { kind: "name", name: symbol.name, hint: symbol.hint }
@@ -377,7 +403,15 @@ export const analysePeImports = async (
               }
             : { kind: "unreadable", rva: symbol.rva },
       );
-    });
+    };
+    const facts = await walkImports(
+      bytes,
+      layout,
+      table,
+      work,
+      visitSymbol,
+      dependency,
+    );
     counts.unreadable += facts.unreadableDescriptors;
     tableDisagreements += facts.tableDisagreements;
     if (facts.truncatedAfterErrors)
@@ -551,7 +585,11 @@ export const analysePeImports = async (
       ),
     },
     runtime_execution: "not-performed",
-    limitations: [...PE_IMPORTS_LIMITATIONS, ...walkLimitations],
+    limitations: [
+      ...PE_IMPORTS_LIMITATIONS,
+      ...walkLimitations,
+      ...(declaresHybridMetadata(bytes, layout) ? [HYBRID_LIMITATION] : []),
+    ],
   };
   return result;
 };
