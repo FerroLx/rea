@@ -28,6 +28,64 @@ describe("binary import taxonomy", () => {
       expect(known.has(entry.category)).toBe(true);
   });
 
+  it("reports no strong capability for the Windows Go runtime's own imports", () => {
+    // Every import of a stock Go 1.2x windows/amd64 binary (esbuild 0.2x).
+    const goRuntime = [
+      "WriteFile",
+      "WriteConsoleW",
+      "WerSetFlags",
+      "WerGetFlags",
+      "WaitForMultipleObjects",
+      "WaitForSingleObject",
+      "VirtualQuery",
+      "VirtualFree",
+      "VirtualAlloc",
+      "TlsAlloc",
+      "SwitchToThread",
+      "SuspendThread",
+      "SetWaitableTimer",
+      "SetThreadPriority",
+      "SetProcessPriorityBoost",
+      "SetEvent",
+      "SetErrorMode",
+      "SetConsoleCtrlHandler",
+      "RtlVirtualUnwind",
+      "RtlLookupFunctionEntry",
+      "ResumeThread",
+      "RaiseFailFastException",
+      "PostQueuedCompletionStatus",
+      "LoadLibraryW",
+      "LoadLibraryExW",
+      "SetThreadContext",
+      "GetThreadContext",
+      "GetSystemInfo",
+      "GetSystemDirectoryA",
+      "GetStdHandle",
+      "GetQueuedCompletionStatusEx",
+      "GetProcessAffinityMask",
+      "GetProcAddress",
+      "GetErrorMode",
+      "GetEnvironmentStringsW",
+      "GetCurrentThreadId",
+      "GetConsoleMode",
+      "FreeEnvironmentStringsW",
+      "ExitProcess",
+      "DuplicateHandle",
+      "CreateWaitableTimerExW",
+      "CreateWaitableTimerA",
+      "CreateThread",
+      "CreateIoCompletionPort",
+      "CreateEventA",
+      "CloseHandle",
+      "AddVectoredExceptionHandler",
+      "AddVectoredContinueHandler",
+    ];
+    const strong = goRuntime.filter(
+      (api) => importTaxonomyEntry(api)?.confidence === "strong",
+    );
+    expect(strong).toEqual([]);
+  });
+
   it("maps credential stores to T1555, not credential dumping", () => {
     expect(importTaxonomyEntry("CredEnumerateW")?.attack).toEqual(["T1555"]);
     expect(importTaxonomyEntry("MiniDumpWriteDump")).toMatchObject({

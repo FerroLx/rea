@@ -74,12 +74,15 @@ export const BINARY_IMPORT_TAXONOMY: readonly ImportTaxonomyEntry[] = [
     "NtWriteVirtualMemory",
     "NtCreateThreadEx",
     "RtlCreateUserThread",
-    "QueueUserAPC",
     "NtQueueApcThread",
-    "SetThreadContext",
     "NtMapViewOfSection",
   ]),
+  // SetThreadContext is imported by every Windows Go runtime (goroutine
+  // preemption) and by debuggers; QueueUserAPC by ordinary thread-wakeup code.
+  // Both are injection primitives but not rare without injection.
   ...e("process_injection", ["T1055"], "medium", [
+    "SetThreadContext",
+    "QueueUserAPC",
     "VirtualAllocEx",
     "VirtualProtectEx",
     "NtAllocateVirtualMemory",
