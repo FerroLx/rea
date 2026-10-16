@@ -27,7 +27,15 @@ export interface PeSection {
   readonly name: string;
   readonly rva: number;
   readonly virtualSize: number;
+  /**
+   * File offset of the section's raw data as the loader reads it: the declared
+   * PointerToRawData rounded down to a 512-byte sector, except in a
+   * low-alignment image (SectionAlignment below a page) whose pointer equals
+   * its RVA. pefile applies the same rule.
+   */
   readonly offset: number;
+  /** PointerToRawData as declared. */
+  readonly rawPointer: number;
   readonly size: number;
   readonly characteristics: number;
 }
@@ -103,6 +111,7 @@ export const readPeImageLayout = (bytes: Buffer) => {
     ? bytes.readBigUInt64LE(optional + 24)
     : BigInt(bytes.readUInt32LE(optional + 28));
   const subsystem = bytes.readUInt16LE(optional + 68);
+  const sectionAlignment = bytes.readUInt32LE(optional + 32);
   const headerSize = bytes.readUInt32LE(optional + 60);
   const table = optional + optionalSize;
   requirePeRange(bytes, table, sectionCount * 40);
@@ -113,11 +122,17 @@ export const readPeImageLayout = (bytes: Buffer) => {
     const at = table + index * 40;
     const nameBytes = bytes.subarray(at, at + 8);
     const nul = nameBytes.indexOf(0);
+    const rva = bytes.readUInt32LE(at + 12);
+    const rawPointer = bytes.readUInt32LE(at + 20);
     const section: PeSection = {
       name: nameBytes.subarray(0, nul === -1 ? 8 : nul).toString("latin1"),
-      rva: bytes.readUInt32LE(at + 12),
+      rva,
       virtualSize: bytes.readUInt32LE(at + 8),
-      offset: bytes.readUInt32LE(at + 20),
+      offset:
+        sectionAlignment < 0x1000 && rawPointer === rva
+          ? rawPointer
+          : rawPointer - (rawPointer % 0x200),
+      rawPointer,
       size: bytes.readUInt32LE(at + 16),
       characteristics: bytes.readUInt32LE(at + 36),
     };

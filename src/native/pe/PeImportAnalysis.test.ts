@@ -197,4 +197,15 @@ describe("PE image layouts the loader accepts", () => {
       (await analyse(peImportFixture({ imports: [INJECTION] }))).imphash,
     );
   });
+
+  it("reads an unaligned PointerToRawData from its 512-byte sector, as the loader and pefile do", async () => {
+    const aligned = await analyse(peImportFixture({ imports: [INJECTION] }));
+    const report = await analyse(
+      peImportFixture({ imports: [INJECTION], rawPointer: 0x420 }),
+    );
+    expect(report.imports).toEqual(aligned.imports);
+    expect(report.import_table_disagreements.count).toBe(0);
+    expect(report.counts.unreadable).toBe(0);
+    expect(report.imphash).toBe(aligned.imphash);
+  });
 });

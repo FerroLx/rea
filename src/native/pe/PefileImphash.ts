@@ -71,8 +71,7 @@ const tick = async (walk: Walk): Promise<void> => {
  * pefile's section extents (`get_VirtualAddress_adj`,
  * `get_PointerToRawData_adj`, `contains_rva`): the virtual address rounded
  * down to the section alignment (the file alignment when that is below a
- * page), the raw pointer rounded down to 0x200 (kept when it equals the
- * virtual address under a sub-page alignment), the raw-or-virtual size (the
+ * page), the layout's sector-adjusted raw pointer, the raw-or-virtual size (the
  * virtual size when the raw data runs past the file) capped at the next
  * section in table order, and reads ending at the unadjusted raw end.
  */
@@ -90,10 +89,7 @@ const sectionExtents = (bytes: Buffer, layout: PeImageLayout): Extent[] => {
       alignment !== 0 && section.rva % alignment !== 0
         ? alignment * Math.floor(section.rva / alignment)
         : section.rva;
-    const pointer =
-      sectionAlignment < 0x1000 && section.offset === section.rva
-        ? section.rva
-        : section.offset & ~0x1ff;
+    const pointer = section.offset;
     let size =
       bytes.length - pointer < section.size
         ? section.virtualSize
@@ -109,7 +105,7 @@ const sectionExtents = (bytes: Buffer, layout: PeImageLayout): Extent[] => {
       rva: virtualAddress,
       end: virtualAddress + size,
       offset: pointer,
-      rawEnd: section.offset + section.size,
+      rawEnd: section.rawPointer + section.size,
     };
   });
 };
@@ -123,7 +119,7 @@ const pefileHeaderLength = (bytes: Buffer, layout: PeImageLayout): number => {
   const optionalSize = bytes.readUInt16LE(pe + 20);
   const tableEnd = pe + 24 + optionalSize + layout.sections.length * 40;
   const pointers = layout.sections
-    .map((section) => section.offset)
+    .map((section) => section.rawPointer)
     .filter((offset) => offset > 0)
     .map((offset) => offset & ~0x1ff);
   const lowest = pointers.length === 0 ? 0 : Math.min(...pointers);
