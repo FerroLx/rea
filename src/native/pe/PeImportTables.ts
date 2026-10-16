@@ -94,9 +94,6 @@ const readName = (
     : null;
 };
 
-/** pefile's `is_valid_function_name` (letters, digits and `._?@$()<>`). */
-const PEFILE_FUNCTION_NAME = /^[A-Za-z0-9._?@$()<>]*$/;
-
 /**
  * The first of `candidates` (RVAs, 0/null = absent) that is mapped and whose
  * first thunk is non-zero, as its file span; null when none is.
@@ -120,48 +117,99 @@ const firstPopulatedTable = (
   return null;
 };
 
-/** pefile's function-name charset, as byte codes (letters, digits, `._?@$()<>`). */
-const isPefileNameByte = (byte: number): boolean =>
-  (byte >= 0x30 && byte <= 0x39) ||
-  (byte >= 0x41 && byte <= 0x5a) ||
-  (byte >= 0x61 && byte <= 0x7a) ||
-  byte === 0x2e ||
-  byte === 0x5f ||
-  byte === 0x3f ||
-  byte === 0x40 ||
-  byte === 0x24 ||
-  byte === 0x28 ||
-  byte === 0x29 ||
-  byte === 0x3c ||
-  byte === 0x3e;
-
 /**
- * How pefile treats a by-name thunk, read in place without allocating:
- * unreadable (it aborts the descriptor), listed, or skipped as invalid.
+ * Whether two thunk arrays import different symbols, read in place up to the
+ * first terminator of either. Entries are compared by meaning (the same
+ * ordinal, or the same name), so an address table pointing at its own copies
+ * of identical hint/name entries is not a disagreement.
  */
-const pefileNameState = (
+const tablesDisagree = (
   bytes: Buffer,
   layout: PeImageLayout,
-  hintRva: number,
+  lookup: { readonly offset: number; readonly length: number },
+  address: { readonly offset: number; readonly length: number },
+  width: number,
+  dll: string,
   work: PeWork,
-): "unreadable" | "listed" | "invalid" => {
-  const hint = layout.availableBytes(hintRva);
-  if (hint === null || hint.length < 3) return "unreadable";
-  const span = layout.availableBytes(hintRva + 2);
-  if (span === null) return "unreadable";
-  const limit = Math.min(span.length, PE_NAME_MAX_BYTES);
-  let at = 0;
-  for (; at < limit; at++) {
-    const byte = bytes[span.offset + at]!;
-    if (byte === 0) break;
-    if (!isPefileNameByte(byte)) {
-      charge(work, at + 1);
-      return "invalid";
-    }
+): boolean => {
+  const read = (span: typeof lookup, t: number): bigint =>
+    width === 8
+      ? bytes.readBigUInt64LE(span.offset + t * width)
+      : BigInt(bytes.readUInt32LE(span.offset + t * width));
+  const same = (a: PeImportedSymbol, b: PeImportedSymbol): boolean =>
+    (a.kind === "ordinal" && b.kind === "ordinal" && a.ordinal === b.ordinal) ||
+    (a.kind === "name" && b.kind === "name" && a.name === b.name);
+  const entries = Math.floor(Math.min(lookup.length, address.length) / width);
+  for (let t = 0; t < entries; t++) {
+    charge(work, 1);
+    const a = read(lookup, t);
+    const b = read(address, t);
+    if (a === 0n || b === 0n) return a !== b;
+    if (
+      a !== b &&
+      !same(
+        thunkSymbol(bytes, layout, a, width, dll, work),
+        thunkSymbol(bytes, layout, b, width, dll, work),
+      )
+    )
+      return true;
   }
-  charge(work, at + 1);
-  // pefile appends a name only when it is non-empty (`if imp_ord or imp_name`).
-  return at === 0 ? "invalid" : "listed";
+  // One array ran out of mapped bytes before both terminated.
+  return lookup.length !== address.length;
+};
+
+/** Decode one non-zero thunk value as an ordinal, a hint/name or unreadable. */
+const thunkSymbol = (
+  bytes: Buffer,
+  layout: PeImageLayout,
+  value: bigint,
+  width: number,
+  dll: string,
+  work: PeWork,
+): PeImportedSymbol => {
+  const ordinalFlag = width === 8 ? 1n << 63n : 1n << 31n;
+  if ((value & ordinalFlag) !== 0n) {
+    const ordinal = Number(value & 0xffffn);
+    const resolved = peOrdinalName(dll, ordinal);
+    return {
+      kind: "ordinal",
+      ordinal,
+      resolved,
+      resolvedFromTable: resolved !== `ord${String(ordinal)}`,
+    };
+  }
+  const hintRva = Number(value & 0x7fffffffn);
+  const hintSpan = layout.availableBytes(hintRva);
+  const name =
+    hintSpan === null || hintSpan.length < 3
+      ? null
+      : readName(bytes, layout, hintRva + 2, work, true);
+  return hintSpan === null || name === null
+    ? { kind: "unreadable", rva: hintRva }
+    : { kind: "name", name, hint: bytes.readUInt16LE(hintSpan.offset) };
+};
+
+/** Stream every entry of a thunk array up to its terminator. */
+const walkThunks = async (
+  bytes: Buffer,
+  layout: PeImageLayout,
+  span: { readonly offset: number; readonly length: number },
+  width: number,
+  work: PeWork,
+  dll: string,
+  visit: (symbol: PeImportedSymbol) => void,
+): Promise<void> => {
+  const entries = Math.floor(span.length / width);
+  for (let t = 0; t < entries; t++) {
+    charge(work, 1);
+    if (stepDue(work)) await yieldWork(work);
+    const value =
+      width === 8
+        ? bytes.readBigUInt64LE(span.offset + t * width)
+        : BigInt(bytes.readUInt32LE(span.offset + t * width));
+    if (value === 0n) return;
+    visit(thunkSymbol(bytes, layout, value, width, dll, work));
+  }
 };
 
 export type PeImportedSymbol =
@@ -183,11 +231,12 @@ export interface PeImportVisit {
   readonly dll: string | null;
   readonly symbol: PeImportedSymbol;
   /**
-   * pefile lists (and so hashes) this symbol. False for a name outside
-   * pefile's function-name charset, and for every symbol of a descriptor
-   * pefile aborts (an unreadable hint/name entry); REA still reports them.
+   * `lookup`: what the loader binds. `address`: an entry of an unbound
+   * descriptor's FirstThunk table that disagrees with its lookup table; the
+   * loader never binds it, but tools that read the address table (pefile,
+   * VirusTotal) report it, so the disagreement is itself evidence.
    */
-  readonly pefileListed: boolean;
+  readonly source: "lookup" | "address";
 }
 
 export interface PeImportWalkFacts {
@@ -198,6 +247,8 @@ export interface PeImportWalkFacts {
   readonly delayVaUnmapped: number;
   /** The walk gave up after too many unusable descriptors (as pefile does). */
   readonly truncatedAfterErrors: boolean;
+  /** Unbound import descriptors whose lookup and address tables disagree. */
+  readonly tableDisagreements: number;
 }
 
 /** pefile stops an import walk once more than this many descriptors failed. */
@@ -235,6 +286,7 @@ export const walkImports = async (
     thunks: 0,
     delayVaUnmapped: 0,
     truncatedAfterErrors: false,
+    tableDisagreements: 0,
   };
   if (directory === null || directory.rva === 0) return facts;
   const span = layout.availableBytes(directory.rva);
@@ -264,14 +316,20 @@ export const walkImports = async (
     }
     facts.descriptors += 1;
     let nameRva: number;
-    // The lookup (OriginalFirstThunk / pINT) and address (FirstThunk / pIAT)
-    // tables. Like pefile, the lookup table is used when it holds entries and
-    // the address table otherwise, so an emptied lookup table cannot hide a
-    // populated address table.
+    // What the loader binds: an import descriptor's OriginalFirstThunk when it
+    // is set (FirstThunk only when it is 0); a delay descriptor's pINT, or its
+    // pIAT when the pINT holds nothing (the delay IAT normally holds stubs).
     let candidates: readonly (number | null)[];
+    let addressTable: number | null = null;
     if (table === "import") {
       nameRva = bytes.readUInt32LE(at + 12);
-      candidates = [bytes.readUInt32LE(at), bytes.readUInt32LE(at + 16)];
+      const lookup = bytes.readUInt32LE(at);
+      const address = bytes.readUInt32LE(at + 16);
+      candidates = lookup !== 0 ? [lookup] : [address];
+      // An unbound descriptor's FirstThunk mirrors its lookup table until the
+      // loader overwrites it; a bound one holds addresses.
+      if (lookup !== 0 && address !== 0 && bytes.readUInt32LE(at + 4) === 0)
+        addressTable = address;
     } else {
       const rvaBased = (bytes.readUInt32LE(at) & 1) === 1;
       const name = delayField(bytes.readUInt32LE(at + 4), rvaBased, layout);
@@ -287,105 +345,72 @@ export const walkImports = async (
       ];
     }
     const thunks = firstPopulatedTable(bytes, layout, candidates, thunkWidth);
-    // pefile counts a descriptor toward its failure limit only when it yields
-    // no imports; an unreadable DLL name merely drops the descriptor.
-    // Counting names too would let planted nameless decoys end the walk early
-    // and hide the descriptors pefile (and VirusTotal) still read.
-    if (thunks === null) {
+    const address =
+      addressTable === null
+        ? null
+        : firstPopulatedTable(bytes, layout, [addressTable], thunkWidth);
+    // A descriptor counts toward the failure limit only when no table yields
+    // an entry; an unreadable DLL name merely drops it. Counting names too
+    // would let planted nameless decoys end the walk early.
+    if (thunks === null && address === null) {
       facts.unreadableDescriptors += 1;
       unusable += 1;
       continue;
     }
-    const maxThunks = Math.floor(thunks.length / thunkWidth);
     const dll =
       nameRva === 0 ? null : readName(bytes, layout, nameRva, work, true);
     if (dll === null || dll === "") {
       facts.unreadableDescriptors += 1;
       continue;
     }
-    const ordinalFlag = thunkWidth === 8 ? 1n << 63n : 1n << 31n;
-    const thunkAt = (t: number): bigint => {
-      const at = thunks.offset + t * thunkWidth;
-      return thunkWidth === 8
-        ? bytes.readBigUInt64LE(at)
-        : BigInt(bytes.readUInt32LE(at));
-    };
-    // Pass 1, allocation-free: does pefile list this descriptor at all? One
-    // unreadable entry aborts it there, and a name outside its function-name
-    // charset is skipped. Streaming in two passes keeps memory flat however
-    // many thunks a descriptor declares.
-    let aborted = false;
-    let anyListed = false;
-    for (let t = 0; t < maxThunks; t++) {
-      charge(work, 1);
-      if (stepDue(work)) await yieldWork(work);
-      const value = thunkAt(t);
-      if (value === 0n) break;
-      if ((value & ordinalFlag) !== 0n) {
-        anyListed = true;
-        continue;
+    if (thunks !== null) {
+      const maxThunks = Math.floor(thunks.length / thunkWidth);
+      let terminated = false;
+      for (let t = 0; t < maxThunks; t++) {
+        charge(work, 1);
+        if (stepDue(work)) await yieldWork(work);
+        const at = thunks.offset + t * thunkWidth;
+        const value =
+          thunkWidth === 8
+            ? bytes.readBigUInt64LE(at)
+            : BigInt(bytes.readUInt32LE(at));
+        if (value === 0n) {
+          terminated = true;
+          break;
+        }
+        facts.thunks += 1;
+        visit({
+          table,
+          descriptor: index,
+          dll,
+          symbol: thunkSymbol(bytes, layout, value, thunkWidth, dll, work),
+          source: "lookup",
+        });
       }
-      const state = pefileNameState(
+      // A lookup table that runs out of section without a terminator is damaged.
+      if (!terminated) facts.unreadableDescriptors += 1;
+    }
+    // An unbound descriptor's address table that differs from its lookup table
+    // (including a populated one behind an empty lookup table) is reported
+    // with its provenance: the loader never binds it, but it is what pefile
+    // and VirusTotal show.
+    if (
+      address !== null &&
+      (thunks === null ||
+        tablesDisagree(bytes, layout, thunks, address, thunkWidth, dll, work))
+    ) {
+      facts.tableDisagreements += 1;
+      await walkThunks(
         bytes,
         layout,
-        Number(value & 0x7fffffffn),
+        address,
+        thunkWidth,
         work,
-      );
-      if (state === "unreadable") {
-        aborted = true;
-        break;
-      }
-      if (state === "listed") anyListed = true;
-    }
-    if (aborted || !anyListed) unusable += 1;
-    // Pass 2: report every entry REA reads, flagging what pefile lists.
-    let terminated = false;
-    for (let t = 0; t < maxThunks; t++) {
-      charge(work, 1);
-      if (stepDue(work)) await yieldWork(work);
-      const value = thunkAt(t);
-      if (value === 0n) {
-        terminated = true;
-        break;
-      }
-      facts.thunks += 1;
-      let symbol: PeImportedSymbol;
-      if ((value & ordinalFlag) !== 0n) {
-        const ordinal = Number(value & 0xffffn);
-        const resolved = peOrdinalName(dll, ordinal);
-        symbol = {
-          kind: "ordinal",
-          ordinal,
-          resolved,
-          resolvedFromTable: resolved !== `ord${String(ordinal)}`,
-        };
-      } else {
-        const hintRva = Number(value & 0x7fffffffn);
-        const hintSpan = layout.availableBytes(hintRva);
-        const name =
-          hintSpan === null || hintSpan.length < 3
-            ? null
-            : readName(bytes, layout, hintRva + 2, work, true);
-        symbol =
-          hintSpan === null || name === null
-            ? { kind: "unreadable", rva: hintRva }
-            : { kind: "name", name, hint: bytes.readUInt16LE(hintSpan.offset) };
-      }
-      const listed =
-        symbol.kind === "ordinal" ||
-        (symbol.kind === "name" &&
-          symbol.name !== "" &&
-          PEFILE_FUNCTION_NAME.test(symbol.name));
-      visit({
-        table,
-        descriptor: index,
         dll,
-        symbol,
-        pefileListed: listed && !aborted,
-      });
+        (symbol) =>
+          visit({ table, descriptor: index, dll, symbol, source: "address" }),
+      );
     }
-    // A lookup table that runs out of section without a terminator is damaged.
-    if (!terminated) facts.unreadableDescriptors += 1;
   }
   return facts;
 };

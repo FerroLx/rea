@@ -147,16 +147,29 @@ describe("PE import analysis", () => {
     expect(report.imphash).toBe("380339ab1085cc666c191cdf275d4ade");
   });
 
-  it("falls back to FirstThunk when OriginalFirstThunk names an empty table, as pefile does", async () => {
+  it("flags an address table that disagrees with the empty lookup table the loader binds", async () => {
     const bytes = peImportFixture({ imports: [INJECTION] });
     bytes.writeUInt32LE(0x2000 + 20, 0x400); // OFT -> the all-zero terminator
     const report = await analyse(bytes);
-    expect(report.counts.imports).toBe(3);
-    expect(report.capabilities.map((c) => c.category)).toContain(
-      "process_injection",
+    // The loader binds nothing; the address table is evidence, not imports.
+    expect(report.counts.imports).toBe(0);
+    expect(report.import_table_disagreements).toEqual({
+      count: 1,
+      dlls: ["KERNEL32.dll"],
+    });
+    const injection = report.capabilities.find(
+      (c) => c.category === "process_injection",
     );
-    // pefile 2024.8.26 on the same bytes.
+    expect(injection?.apis.every((api) => api.via === "address_table")).toBe(
+      true,
+    );
+    // pefile 2024.8.26 (which hashes the address table) on the same bytes.
     expect(report.imphash).toBe("f912da22ec1b66d09c386ee92da61a68");
+  });
+
+  it("does not flag tables that import the same symbols through separate entries", async () => {
+    const report = await analyse(peImportFixture({ imports: [INJECTION] }));
+    expect(report.import_table_disagreements.count).toBe(0);
   });
 
   it("keeps a descriptor whose DLL name has no terminator within 512 bytes", async () => {

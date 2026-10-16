@@ -239,7 +239,15 @@ The default summary is a few kilobytes:
   marks `argument_dependent` APIs whose meaning depends on arguments static
   analysis cannot see. `file_enumeration` is opt-in through `categories`.
 - `imphash`: the import hash exactly as pefile 2024.8.26 computes it (import
-  table only), so it pivots against existing threat-intelligence data.
+  table only), so it pivots against existing threat-intelligence data. It is
+  computed by a separate emulation of pefile's import parsing, including its
+  anti-abuse heuristics and symbol cap, because pefile can read a different
+  table than the loader binds.
+- `import_table_disagreements`: unbound descriptors whose FirstThunk (address)
+  table imports different symbols than the OriginalFirstThunk (lookup) table.
+  REA reports what the loader binds (the lookup table); compilers emit
+  identical tables, so a disagreement is crafted. The address table's
+  taxonomy hits still appear in `capabilities`, marked `via: "address_table"`.
 - `dlls`: imported DLLs in first-appearance order; API-set names are tagged.
 - `runtime_resolution`: imported resolvers (`GetProcAddress`, `LoadLibrary*`,
   `Ldr*`) and taxonomy API names that appear as ASCII or UTF-16 strings but are
@@ -268,8 +276,8 @@ delay-load addresses) instead of being guessed. As in pefile, an unusable
 import descriptor is skipped rather than ending the table, so one planted bad
 descriptor cannot hide the imports after it, and a walk stops once more than
 five descriptors have failed (stated in `limitations`). Where pefile's own
-parser discards a damaged table entirely, REA still reports the imports it can
-read, so on such damaged tables only, `imphash` can differ from pefile. ELF and Mach-O are not yet
+parser discards a damaged table, REA still reports the imports it can read,
+while `imphash` stays pefile's. ELF and Mach-O are not yet
 supported.
 
 `npm run verify:binary-imports` builds x86 and x64 mingw-w64 fixtures and

@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { setImmediate } from "node:timers/promises";
 
 import {
@@ -23,6 +22,7 @@ import {
   walkExports,
   walkImports,
 } from "./PeImportTables.js";
+import { pefileImphash } from "./PefileImphash.js";
 
 /** Matched APIs listed per capability (the total is always reported). */
 const CAPABILITY_SAMPLE = 8;
@@ -53,6 +53,8 @@ const FEW_IMPORTS = 10;
 /** A section with no raw data and at least this virtual size is a packer tell. */
 const LARGE_VIRTUAL = 0x10000;
 /** Bytes scanned between cooperative yields. */
+/** DLL names kept for import-table disagreements. */
+const DISAGREEMENT_SAMPLE = 16;
 const SCAN_YIELD_BYTES = 1024 * 1024;
 
 const TIER_RANK: Record<ImportConfidence, number> = {
@@ -68,24 +70,7 @@ const SCN_MEM_WRITE = 0x80000000;
 
 const isApiSet = (dll: string): boolean => /^(api|ext)-ms-/i.test(dll);
 
-/** pefile's `allowed_filename` plus path separators (`is_valid_dos_filename`). */
-const DOS_FILENAME = /^[A-Za-z0-9!#$%&'()\-@^_`{}~+,.;=[\]:\\/]*$/;
-
-/**
- * pefile's imphash library name: a name outside its DOS filename charset is
- * `*invalid*`; otherwise lowercased with only a dll/ocx/sys extension stripped
- * (`rsplit(".", 1)`, so `.dll` becomes the empty name).
- */
-const imphashLibrary = (dll: string): string => {
-  if (!DOS_FILENAME.test(dll)) return "*invalid*";
-  const lower = dll.toLowerCase();
-  const dot = lower.lastIndexOf(".");
-  return dot !== -1 && ["dll", "ocx", "sys"].includes(lower.slice(dot + 1))
-    ? lower.slice(0, dot)
-    : lower;
-};
-
-/** The name a symbol contributes to matching and the imphash. */
+/** The name a symbol contributes to capability matching. */
 const symbolName = (symbol: PeImportedSymbol): string | null =>
   symbol.kind === "name"
     ? symbol.name
@@ -277,18 +262,50 @@ export const analysePeImports = async (
   const capabilities = new Map<string, CapabilityAccumulator>();
   const imported = new Set<string>();
   const resolverImports = new Set<string>();
-  const imphash = createHash("md5");
-  let imphashParts = 0;
-  // Hash input is batched (one update per ~64 KiB, not per symbol) and the
-  // per-DLL values are computed once per run of symbols from the same DLL.
-  let pendingHash = "";
-  const flushHash = (): void => {
-    if (pendingHash.length > 0) imphash.update(pendingHash);
-    pendingHash = "";
+  /** Address-table-only descriptors, keyed by table and index (DLL name). */
+  const disagreeingDescriptors = new Map<string, string>();
+  let tableDisagreements = 0;
+  const recordCapability = (
+    name: string,
+    dll: string,
+    via: "import" | "delay" | "address_table",
+  ): void => {
+    const entry = importTaxonomyEntry(name);
+    if (entry === undefined) return;
+    imported.add(name);
+    if (via !== "address_table" && RESOLVER_APIS.has(name))
+      resolverImports.add(name);
+    if (!categories.has(entry.category)) return;
+    const cap = capabilities.get(entry.category) ?? {
+      attack: entry.attack,
+      total: 0,
+      apis: [],
+    };
+    cap.total += 1;
+    cap.apis.push({
+      api: name,
+      dll,
+      via,
+      confidence: entry.confidence,
+      argument_dependent: entry.argumentDependent === true,
+    });
+    // Keep only the strongest few, deterministically.
+    cap.apis.sort(
+      (a, b) =>
+        TIER_RANK[a.confidence] - TIER_RANK[b.confidence] ||
+        a.dll.localeCompare(b.dll) ||
+        a.api.localeCompare(b.api),
+    );
+    if (cap.apis.length > CAPABILITY_SAMPLE) cap.apis.pop();
+    capabilities.set(entry.category, cap);
   };
+  const addressTableHit = (symbol: PeImportedSymbol, dll: string): void => {
+    const name = symbolName(symbol);
+    if (name !== null) recordCapability(name, dll, "address_table");
+  };
+  // The per-DLL key is computed once per run of symbols from the same DLL.
   let lastDll: string | null = null;
   let lastKey = "";
-  let lastLibrary = "";
   const walkLimitations: string[] = [];
   const detailImports: NonNullable<BinaryImportsResult["detail"]>["imports"] =
     [];
@@ -301,10 +318,20 @@ export const analysePeImports = async (
     let lastDescriptor = -1;
     const facts = await walkImports(bytes, layout, table, work, (visit) => {
       const dll = visit.dll ?? "";
+      if (visit.source === "address") {
+        // Never bound by the loader: only a disagreement fact and capability
+        // evidence, not an import.
+        if (disagreeingDescriptors.size < DISAGREEMENT_SAMPLE + 1)
+          disagreeingDescriptors.set(
+            `${table}:${String(visit.descriptor)}`,
+            dll,
+          );
+        addressTableHit(visit.symbol, dll);
+        return;
+      }
       if (dll !== lastDll) {
         lastDll = dll;
         lastKey = `${table}:${dll.toLowerCase()}`;
-        lastLibrary = imphashLibrary(dll);
       }
       const key = lastKey;
       const known = dlls.get(key);
@@ -325,44 +352,7 @@ export const analysePeImports = async (
         if (!symbol.resolvedFromTable) counts.ordinal_unresolved += 1;
       } else counts.unreadable += 1;
       const name = symbolName(symbol);
-      // pefile hashes the import table only, in descriptor and thunk order,
-      // and only the symbols it lists.
-      if (table === "import" && name !== null && visit.pefileListed) {
-        pendingHash += `${imphashParts === 0 ? "" : ","}${lastLibrary}.${name.toLowerCase()}`;
-        imphashParts += 1;
-        if (pendingHash.length >= 65_536) flushHash();
-      }
-      if (name !== null) {
-        const entry = importTaxonomyEntry(name);
-        if (entry !== undefined) {
-          imported.add(name);
-          if (RESOLVER_APIS.has(name)) resolverImports.add(name);
-          if (categories.has(entry.category)) {
-            const cap = capabilities.get(entry.category) ?? {
-              attack: entry.attack,
-              total: 0,
-              apis: [],
-            };
-            cap.total += 1;
-            cap.apis.push({
-              api: name,
-              dll,
-              via: table,
-              confidence: entry.confidence,
-              argument_dependent: entry.argumentDependent === true,
-            });
-            // Keep only the strongest few, deterministically.
-            cap.apis.sort(
-              (a, b) =>
-                TIER_RANK[a.confidence] - TIER_RANK[b.confidence] ||
-                a.dll.localeCompare(b.dll) ||
-                a.api.localeCompare(b.api),
-            );
-            if (cap.apis.length > CAPABILITY_SAMPLE) cap.apis.pop();
-            capabilities.set(entry.category, cap);
-          }
-        }
-      }
+      if (name !== null) recordCapability(name, dll, table);
       if (options.detail) {
         detailBytes +=
           DETAIL_SYMBOL_BYTES + 2 * (name?.length ?? 0) + 2 * dll.length;
@@ -387,6 +377,7 @@ export const analysePeImports = async (
       }
     });
     counts.unreadable += facts.unreadableDescriptors;
+    tableDisagreements += facts.tableDisagreements;
     if (facts.truncatedAfterErrors)
       walkLimitations.push(
         `The ${table === "import" ? "import" : "delay-load import"} table was read only until more than five descriptors proved unusable (pefile's rule); later descriptors were not examined.`,
@@ -443,6 +434,9 @@ export const analysePeImports = async (
     await setImmediate();
     options.signal?.throwIfAborted();
   }
+  // pefile's view of the import table, owned by its emulation: threat
+  // intelligence pivots on it even where it differs from what the loader binds.
+  const imphash = await pefileImphash(bytes, layout, work);
   const importCount = counts.imports + counts.delay_imports;
   const overlay =
     layout.overlay.size === 0
@@ -481,7 +475,7 @@ export const analysePeImports = async (
       entry_point_rva: layout.entryPoint,
     },
     taxonomy_version: BINARY_IMPORT_TAXONOMY_VERSION,
-    imphash: imphashParts === 0 ? null : (flushHash(), imphash.digest("hex")),
+    imphash,
     counts,
     categories_scanned: [...categories].sort(),
     capabilities: [...capabilities.entries()]
@@ -504,6 +498,10 @@ export const analysePeImports = async (
       delay: value.delay,
       api_set: isApiSet(value.name),
     })),
+    import_table_disagreements: {
+      count: tableDisagreements,
+      dlls: [...disagreeingDescriptors.values()].slice(0, DISAGREEMENT_SAMPLE),
+    },
     dlls_truncated: orderedDlls.length > DLL_SAMPLE,
     runtime_resolution: {
       resolver_imports: [...resolverImports].sort(),
