@@ -33,16 +33,19 @@ const STRING_SAMPLE = 8;
 /** Identifier lengths considered by the string scan (shortest taxonomy name is "send"). */
 const MIN_API_STRING = 6;
 const MAX_API_STRING = 64;
-/** Inline output ceiling; detail past it is refused, not truncated. */
+/**
+ * Complete-result ceiling: the tables are always retained as Evidence (summary
+ * delivery pages them), so a result past it is refused, never truncated.
+ */
 export const PE_IMPORTS_OUTPUT_BYTES = 8 * 1024 * 1024;
-/** Projected serialized bytes per detail symbol, before its strings (JSON-escaped at most 2x). */
-const DETAIL_SYMBOL_BYTES = 96;
+/** Projected serialized bytes per table symbol, before its strings (JSON-escaped at most 2x). */
+const TABLE_SYMBOL_BYTES = 96;
 
-/** Thrown when the detail tables would exceed the inline output budget. */
+/** Thrown when the import/export tables would exceed the output budget. */
 export class PeOutputExceeded extends Error {
   constructor(readonly projectedBytes: number) {
     super(
-      `The import/export detail would serialise to more than ${String(PE_IMPORTS_OUTPUT_BYTES)} bytes.`,
+      `The import/export tables would serialise to more than ${String(PE_IMPORTS_OUTPUT_BYTES)} bytes.`,
     );
     this.name = "PeOutputExceeded";
   }
@@ -232,7 +235,6 @@ export const analysePeImports = async (
   artifact: PeImportsResult["artifact"],
   options: {
     readonly categories: readonly string[] | undefined;
-    readonly detail: boolean;
     readonly signal: AbortSignal | undefined;
   },
 ): Promise<PeImportsResult> => {
@@ -307,10 +309,13 @@ export const analysePeImports = async (
   let lastDll: string | null = null;
   let lastKey = "";
   const walkLimitations: string[] = [];
-  const detailImports: NonNullable<PeImportsResult["detail"]>["imports"] = [];
-  // Detail size is projected while it is collected and refused past the
-  // output budget, before the report exists.
-  let detailBytes = 0;
+  const tables: Record<"import" | "delay", PeImportsResult["imports"]> = {
+    import: [],
+    delay: [],
+  };
+  // Table size is projected while it is collected and refused past the output
+  // budget, before the report exists.
+  let tableBytes = 0;
 
   for (const table of ["import", "delay"] as const) {
     lastDll = null; // the cached key includes the table
@@ -352,28 +357,26 @@ export const analysePeImports = async (
       } else counts.unreadable += 1;
       const name = symbolName(symbol);
       if (name !== null) recordCapability(name, dll, table);
-      if (options.detail) {
-        detailBytes +=
-          DETAIL_SYMBOL_BYTES + 2 * (name?.length ?? 0) + 2 * dll.length;
-        if (detailBytes > PE_IMPORTS_OUTPUT_BYTES)
-          throw new PeOutputExceeded(detailBytes);
-        if (visit.descriptor !== lastDescriptor) {
-          detailImports.push({ dll, table, symbols: [] });
-          lastDescriptor = visit.descriptor;
-        }
-        detailImports.at(-1)!.symbols.push(
-          symbol.kind === "name"
-            ? { kind: "name", name: symbol.name, hint: symbol.hint }
-            : symbol.kind === "ordinal"
-              ? {
-                  kind: "ordinal",
-                  ordinal: symbol.ordinal,
-                  resolved: symbol.resolved,
-                  resolved_from_table: symbol.resolvedFromTable,
-                }
-              : { kind: "unreadable", rva: symbol.rva },
-        );
+      tableBytes +=
+        TABLE_SYMBOL_BYTES + 2 * (name?.length ?? 0) + 2 * dll.length;
+      if (tableBytes > PE_IMPORTS_OUTPUT_BYTES)
+        throw new PeOutputExceeded(tableBytes);
+      if (visit.descriptor !== lastDescriptor) {
+        tables[table].push({ dll, symbols: [] });
+        lastDescriptor = visit.descriptor;
       }
+      tables[table].at(-1)!.symbols.push(
+        symbol.kind === "name"
+          ? { kind: "name", name: symbol.name, hint: symbol.hint }
+          : symbol.kind === "ordinal"
+            ? {
+                kind: "ordinal",
+                ordinal: symbol.ordinal,
+                resolved: symbol.resolved,
+                resolved_from_table: symbol.resolvedFromTable,
+              }
+            : { kind: "unreadable", rva: symbol.rva },
+      );
     });
     counts.unreadable += facts.unreadableDescriptors;
     tableDisagreements += facts.tableDisagreements;
@@ -395,15 +398,13 @@ export const analysePeImports = async (
       const dot = visit.target.lastIndexOf(".");
       excluded.add(dot === -1 ? visit.target : visit.target.slice(dot + 1));
     }
-    if (options.detail) {
-      detailBytes +=
-        DETAIL_SYMBOL_BYTES +
-        2 * (visit.name?.length ?? 0) +
-        (visit.kind === "forwarder" ? 2 * (visit.target?.length ?? 0) : 0);
-      if (detailBytes > PE_IMPORTS_OUTPUT_BYTES)
-        throw new PeOutputExceeded(detailBytes);
-      exportEntries.push(visit);
-    }
+    tableBytes +=
+      TABLE_SYMBOL_BYTES +
+      2 * (visit.name?.length ?? 0) +
+      (visit.kind === "forwarder" ? 2 * (visit.target?.length ?? 0) : 0);
+    if (tableBytes > PE_IMPORTS_OUTPUT_BYTES)
+      throw new PeOutputExceeded(tableBytes);
+    exportEntries.push(visit);
   });
   counts.exports = exportFacts.entries;
   counts.exports_named = exportFacts.named;
@@ -529,29 +530,26 @@ export const analysePeImports = async (
       max_section_entropy: maxEntropy,
       overlay,
     },
-    detail: options.detail
-      ? {
-          imports: detailImports,
-          exports: {
-            dll_name: exportFacts.dllName,
-            entries: exportEntries.map((entry) =>
-              entry.kind === "function"
-                ? {
-                    kind: "function",
-                    ordinal: entry.ordinal,
-                    name: entry.name,
-                    rva: entry.rva,
-                  }
-                : {
-                    kind: "forwarder",
-                    ordinal: entry.ordinal,
-                    name: entry.name,
-                    target: entry.target,
-                  },
-            ),
-          },
-        }
-      : null,
+    imports: tables.import,
+    delay_imports: tables.delay,
+    exports: {
+      dll_name: exportFacts.dllName,
+      entries: exportEntries.map((entry) =>
+        entry.kind === "function"
+          ? {
+              kind: "function",
+              ordinal: entry.ordinal,
+              name: entry.name,
+              rva: entry.rva,
+            }
+          : {
+              kind: "forwarder",
+              ordinal: entry.ordinal,
+              name: entry.name,
+              target: entry.target,
+            },
+      ),
+    },
     runtime_execution: "not-performed",
     limitations: [...PE_IMPORTS_LIMITATIONS, ...walkLimitations],
   };

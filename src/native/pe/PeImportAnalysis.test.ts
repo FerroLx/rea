@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { analysePeImports } from "./PeImportAnalysis.js";
 import { peImportFixture } from "./PeImports.fixture.js";
 
-const analyse = (bytes: Buffer, detail = false) =>
+const analyse = (bytes: Buffer) =>
   analysePeImports(
     bytes,
     {
@@ -12,7 +12,7 @@ const analyse = (bytes: Buffer, detail = false) =>
       sha256: createHash("sha256").update(bytes).digest("hex"),
       bytes: bytes.length,
     },
-    { categories: undefined, detail, signal: undefined },
+    { categories: undefined, signal: undefined },
   );
 
 const INJECTION = [
@@ -61,13 +61,10 @@ describe("PE import analysis", () => {
           { name: "Gamma", slot: 1 },
         ],
       }),
-      true,
     );
     expect(report.counts.exports).toBe(3);
     expect(report.counts.exports_named).toBe(3);
-    expect(
-      report.detail?.exports.entries.map((e) => [e.ordinal, e.name]),
-    ).toEqual([
+    expect(report.exports.entries.map((e) => [e.ordinal, e.name])).toEqual([
       [1, "Alpha"],
       [1, "Beta"],
       [2, "Gamma"],

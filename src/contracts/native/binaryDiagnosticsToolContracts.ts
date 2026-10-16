@@ -6,7 +6,10 @@ import {
   inspectBinaryLayoutInputSchema,
   binaryLayoutSchema,
 } from "../../domain/native/binaryLayout.js";
-import { binaryLayoutSummaryViewResultSchema } from "../../domain/analysisView/analysisView.js";
+import {
+  binaryLayoutSummaryViewResultSchema,
+  peImportsSummaryViewResultSchema,
+} from "../../domain/analysisView/analysisView.js";
 import {
   analysisDetailOutputSchemaOf,
   analysisDetailSchema,
@@ -27,6 +30,11 @@ import {
 export const inspectBinaryLayoutRequestSchema =
   inspectBinaryLayoutInputSchema.extend({ detail: analysisDetailSchema });
 
+/** Caller-selected delivery of completed PE import Evidence. */
+export const inspectPeImportsRequestSchema = inspectPeImportsInputSchema.extend(
+  { detail: analysisDetailSchema },
+);
+
 /** Offline binary diagnostics are independent of macOS process/UI providers. */
 export const BINARY_DIAGNOSTICS_TOOL_CONTRACTS = [
   {
@@ -34,17 +42,20 @@ export const BINARY_DIAGNOSTICS_TOOL_CONTRACTS = [
     ...toolContractMetadata("inspect_pe_imports"),
     kind: "native-provider",
     description:
-      'Statically triage what a local Windows PE image (.exe, .dll, .sys) can do, without executing it or opening a disassembler. Reads its import, delay-load import and export tables and groups imported APIs into behaviour categories (process injection, persistence, service control, keyboard capture, credential access, anti-debug, download, dynamic API resolution, driver loading, ...) with MITRE ATT&CK technique IDs and a strong/medium/weak confidence tier per API. Also returns the import hash exactly as pefile computes it, DLLs (API-set names tagged), runtime-resolution hints (resolver imports and API names present as strings but not imported) and packing facts (entry-point section, writable+executable sections, section entropy, overlay). Facts for triage, never a verdict: capabilities mean the imports are consistent with a behaviour. detail "imports" adds the full import/export tables. Portable on supported Node hosts; no engine required.',
-    inputSchema: inspectPeImportsInputSchema,
-    outputSchema: evidenceResultOf(peImportsResultSchema),
+      'Statically triage what a local Windows PE image (.exe, .dll, .sys) can do, without executing it or opening a disassembler. Reads its import, delay-load import and export tables and groups imported APIs into behaviour categories (process injection, persistence, service control, keyboard capture, credential access, anti-debug, download, dynamic API resolution, driver loading, ...) with MITRE ATT&CK technique IDs and a strong/medium/weak confidence tier per API. Also returns the import hash exactly as pefile computes it, DLLs (API-set names tagged), runtime-resolution hints (resolver imports and API names present as strings but not imported) and packing facts (entry-point section, writable+executable sections, section entropy, overlay). Facts for triage, never a verdict: capabilities mean the imports are consistent with a behaviour. Omitted or complete detail returns these facts plus the full import, delay-import and export tables inline. Select detail "summary" to retain that complete Evidence in this session and receive only the triage facts (capabilities, imphash, DLLs, runtime resolution, packing, counts, table disagreements, format); page the tables with inspect_analysis_view view {kind: "pe-imports", collection: "imports" | "delay_imports" | "exports", offset, limit} using normalized_result.parent_evidence_id. Portable on supported Node hosts; no engine required.',
+    inputSchema: inspectPeImportsRequestSchema,
+    outputSchema: analysisDetailOutputSchemaOf(
+      peImportsResultSchema,
+      peImportsSummaryViewResultSchema,
+    ),
     examples: [
       {
         title: "Triage a Windows executable's import surface",
         input: { path: "/artifacts/sample.exe" },
       },
       {
-        title: "Include the full import and export tables",
-        input: { path: "/artifacts/library.dll", detail: "imports" },
+        title: "Retain the complete tables and return the triage summary",
+        input: { path: "/artifacts/library.dll", detail: "summary" },
       },
     ],
   },

@@ -219,17 +219,21 @@ without executing it, opening a disassembler or installing an engine:
 
 ```sh
 rea inspect-pe-imports ./sample.exe --json
-rea inspect-pe-imports ./library.dll --detail imports --json
 ```
 
 ```json
 {
   "name": "inspect_pe_imports",
-  "arguments": { "path": "/artifacts/sample.exe" }
+  "arguments": { "path": "/artifacts/library.dll", "detail": "summary" }
 }
 ```
 
-The default summary is a few kilobytes:
+`detail` follows REA's analysis-detail contract, as in `inspect_binary_layout`:
+omitted or `"complete"` returns the complete result inline, and `"summary"`
+retains that complete Evidence in the MCP session and returns a summary view of
+a few kilobytes. The CLI, like other one-shot CLI commands, always prints the
+complete Evidence; project views from it with `rea inspect-analysis-view` and an
+inline source. The triage facts, present in both forms, are:
 
 - `capabilities`: imported APIs grouped into behaviour categories (process
   injection, persistence, service control, keyboard and screen capture,
@@ -256,9 +260,28 @@ The default summary is a few kilobytes:
   virtual sections, the highest section entropy and the overlay.
 - `format`: architecture, subsystem, DLL and .NET flags.
 
-`detail: "imports"` adds the full import and delay-import tables (ordinal
-imports resolved through pefile's ordinal tables, `ord<N>` otherwise) and the
-export table with forwarders.
+The complete result adds `imports` and `delay_imports` (one entry per
+descriptor, with ordinal imports resolved through pefile's ordinal tables,
+`ord<N>` otherwise) and `exports` (with forwarders). After a summary, page them
+with `inspect_analysis_view`:
+
+```json
+{
+  "name": "inspect_analysis_view",
+  "arguments": {
+    "source": { "kind": "retained-evidence", "evidence_id": "ev_..." },
+    "view": {
+      "kind": "pe-imports",
+      "collection": "exports",
+      "offset": 0,
+      "limit": 64
+    }
+  }
+}
+```
+
+`imports` and `delay_imports` rows are single symbols carrying their
+descriptor index and DLL name; `coverage.next_offset` continues the page.
 
 The taxonomy is versioned (`taxonomy_version`) and built from Microsoft's API
 documentation and MITRE ATT&CK identifiers; no third-party rule text is
@@ -270,7 +293,8 @@ and are not found.
 
 The image is read once as a stable regular-file snapshot of at most 64 MiB.
 Table walks are bounded by a work budget proportional to the file size;
-exhausting it, or a detail answer above 8 MiB, fails without partial output.
+exhausting it, or tables that would serialise above 8 MiB, fails without
+partial output.
 Malformed tables are reported in `counts` (unreadable entries, unmapped
 delay-load addresses) instead of being guessed. As in pefile, an unusable
 import descriptor is skipped rather than ending the table, so one planted bad

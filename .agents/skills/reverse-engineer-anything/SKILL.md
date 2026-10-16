@@ -199,8 +199,9 @@ explicit path or endpoint and do not need it.
 - What a Windows PE (.exe, .dll, .sys) can do, before any disassembly:
   `inspect_pe_imports` with an explicit path. Returns ATT&CK-tagged
   capability categories with strong/medium/weak tiers, pefile-identical
-  imphash, runtime-resolution hints and packing facts in a few KB; add
-  `detail: "imports"` only when the full tables are needed. Capabilities are
+  imphash, runtime-resolution hints and packing facts. Pass
+  `detail: "summary"` for these facts in a few KB; the full tables stay
+  retained and page through `inspect_analysis_view` (kind `pe-imports`). Capabilities are
   "imports consistent with", never a verdict; weak tiers alone mean little.
 - PE resource type/name/language trees and static icon group references:
   `inspect_pe_resources` with an explicit path. This portable operation requires

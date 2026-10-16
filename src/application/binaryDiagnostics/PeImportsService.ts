@@ -73,16 +73,11 @@ export class PeImportsService {
     const result = await this.provider.inspect(input.data, options);
     if (!result.ok) return result;
     const report = peImportsResultSchema.safeParse(result.value);
-    const wantsDetail = input.data.detail === "imports";
-    if (
-      !report.success ||
-      report.data.artifact.path !== input.data.path ||
-      (report.data.detail !== null) !== wantsDetail
-    )
+    if (!report.success || report.data.artifact.path !== input.data.path)
       return err(
         new AnalysisOutputError(
           OPERATION,
-          "Binary import scanner returned malformed output, changed artifact identity, or answered a different detail level.",
+          "PE import scanner returned malformed output or changed artifact identity.",
         ),
       );
     const value = report.data;
@@ -101,9 +96,6 @@ export class PeImportsService {
             ...(input.data.categories === undefined
               ? {}
               : { categories: input.data.categories }),
-            ...(input.data.detail === undefined
-              ? {}
-              : { detail: input.data.detail }),
           },
           result: value,
           confidence: "observed",

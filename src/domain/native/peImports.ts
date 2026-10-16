@@ -23,12 +23,6 @@ export const inspectPeImportsInputSchema = z.strictObject({
     .describe(
       "Behaviour categories to report (default: the sensitive set; add file_enumeration to opt in)",
     ),
-  detail: z
-    .enum(["summary", "imports"])
-    .optional()
-    .describe(
-      'Default "summary"; "imports" also returns the full import and export tables',
-    ),
 });
 export type InspectPeImportsInput = z.infer<typeof inspectPeImportsInputSchema>;
 
@@ -84,6 +78,12 @@ const exportEntry = z.discriminatedUnion("kind", [
     target: z.string().nullable(),
   }),
 ]);
+
+/** One descriptor's symbols (ordinals resolved as pefile does, `ord<N>` otherwise). */
+const importDescriptor = z.strictObject({
+  dll: z.string(),
+  symbols: z.array(importedSymbol),
+});
 
 export const peImportsResultSchema = z.strictObject({
   artifact: z.strictObject({
@@ -185,22 +185,14 @@ export const peImportsResultSchema = z.strictObject({
       .strictObject({ offset: uint, bytes: uint, entropy: z.number() })
       .nullable(),
   }),
-  /** Set only with detail "imports". */
-  detail: z
-    .strictObject({
-      imports: z.array(
-        z.strictObject({
-          dll: z.string(),
-          table: z.enum(["import", "delay"]),
-          symbols: z.array(importedSymbol),
-        }),
-      ),
-      exports: z.strictObject({
-        dll_name: z.string().nullable(),
-        entries: z.array(exportEntry),
-      }),
-    })
-    .nullable(),
+  /** Import-table descriptors the loader binds, in table order. */
+  imports: z.array(importDescriptor),
+  /** Delay-load descriptors, in table order. */
+  delay_imports: z.array(importDescriptor),
+  exports: z.strictObject({
+    dll_name: z.string().nullable(),
+    entries: z.array(exportEntry),
+  }),
   runtime_execution: z.literal("not-performed"),
   limitations: z.array(z.string()),
 });

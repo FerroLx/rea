@@ -57,7 +57,6 @@ export class PeImportsProvider implements PeImportsPort {
           },
           {
             categories: input.categories,
-            detail: input.detail === "imports",
             signal: options?.signal,
           },
         ),
@@ -99,11 +98,7 @@ const primaryFailure = (
       "capacity",
       cause.message,
       { max_output_bytes: PE_IMPORTS_OUTPUT_BYTES },
-      {
-        cause,
-        remediationAction:
-          'Use the default "summary" detail, which is always bounded.',
-      },
+      { cause },
     );
   if (cause instanceof ArtifactReaderFailure) {
     if (cause.reason === "limit")

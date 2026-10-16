@@ -161,21 +161,71 @@ try {
     "output schema invalid",
   );
 
-  /** CLI and MCP must return identical, schema-valid Evidence. */
-  const inspectBoth = async (path) => {
-    const cli = parseEvidence(await inspectCli(path, ["--detail", "imports"]));
+  const callValid = async (args) => {
     const reply = await client.callTool({
       name: "inspect_pe_imports",
-      arguments: { path, detail: "imports" },
+      arguments: args,
     });
     assert.notEqual(reply.isError, true, mcpTextValue(reply));
     assert.ok(
       ajv.validate(advertised.outputSchema, reply.structuredContent),
       JSON.stringify(ajv.errors),
     );
-    const mcp = parseEvidence(reply.structuredContent);
+    return parseEvidence(reply.structuredContent);
+  };
+
+  /** Page one retained collection to exhaustion through inspect_analysis_view. */
+  const pageAll = async (evidenceId, collection) => {
+    const rows = [];
+    for (let offset = 0; offset !== null;) {
+      const reply = await client.callTool({
+        name: "inspect_analysis_view",
+        arguments: {
+          source: { kind: "retained-evidence", evidence_id: evidenceId },
+          view: { kind: "pe-imports", collection, offset, limit: 7 },
+        },
+      });
+      assert.notEqual(reply.isError, true, mcpTextValue(reply));
+      const view = parseEvidence(reply.structuredContent).normalized_result;
+      rows.push(...view.rows);
+      offset = view.coverage.next_offset;
+    }
+    return rows;
+  };
+
+  /**
+   * CLI and MCP must return identical, schema-valid complete Evidence; the
+   * summary must carry the same triage facts and its retained tables must
+   * page back to the complete ones.
+   */
+  const inspectBoth = async (path) => {
+    const cli = parseEvidence(await inspectCli(path));
+    const mcp = await callValid({ path });
     assert.deepEqual(cli, mcp, "CLI and MCP evidence differ");
-    return mcp.normalized_result;
+    const report = mcp.normalized_result;
+    const summary = (await callValid({ path, detail: "summary" }))
+      .normalized_result;
+    assert.equal(summary.parent_operation, "inspect_pe_imports");
+    assert.equal(summary.summary.imphash, report.imphash);
+    assert.deepEqual(summary.summary.capabilities, report.capabilities);
+    assert.deepEqual(summary.summary.counts, report.counts);
+    assert.deepEqual(
+      await pageAll(summary.parent_evidence_id, "exports"),
+      report.exports.entries,
+      "paged exports differ from the complete table",
+    );
+    for (const collection of ["imports", "delay_imports"])
+      assert.deepEqual(
+        (await pageAll(summary.parent_evidence_id, collection)).map((row) => [
+          row.dll,
+          row.symbol,
+        ]),
+        report[collection].flatMap((group) =>
+          group.symbols.map((symbol) => [group.dll, symbol]),
+        ),
+        `paged ${collection} differ from the complete table`,
+      );
+    return report;
   };
 
   /** Every import/delay/export and the imphash must equal pefile's; DLL sets equal llvm-readobj's. */
@@ -183,9 +233,8 @@ try {
     const report = await inspectBoth(path);
     const oracle = await pefile(path);
     const flatten = (table) =>
-      report.detail.imports
-        .filter((group) => group.table === table)
-        .flatMap((group) =>
+      report[table === "import" ? "imports" : "delay_imports"].flatMap(
+        (group) =>
           group.symbols.map((s) => [
             group.dll,
             s.kind === "name"
@@ -194,7 +243,7 @@ try {
                 ? `#${s.ordinal}=${s.resolved}`
                 : "?",
           ]),
-        );
+      );
     assert.deepEqual(
       flatten("import"),
       oracle.imports,
@@ -212,7 +261,7 @@ try {
     );
     assert.deepEqual(
       byOrdinal(
-        report.detail.exports.entries.map((e) => [
+        report.exports.entries.map((e) => [
           e.ordinal,
           e.name,
           e.kind === "forwarder" ? e.target : null,
@@ -222,11 +271,7 @@ try {
       `${label}: exports differ from pefile`,
     );
     const ours = [
-      ...new Set(
-        report.detail.imports
-          .filter((g) => g.table === "import")
-          .map((g) => g.dll.toLowerCase()),
-      ),
+      ...new Set(report.imports.map((g) => g.dll.toLowerCase())),
     ].sort();
     assert.deepEqual(
       ours,
@@ -348,7 +393,7 @@ int main(void) {
       app.capabilities.find((c) => c.category === category);
     assert.equal(capability("process_injection")?.confidence, "strong");
     assert.equal(capability("download")?.confidence, "strong");
-    const ws2 = app.detail.imports
+    const ws2 = [...app.imports, ...app.delay_imports]
       .flatMap((g) => g.symbols)
       .find((s) => s.kind === "ordinal" && s.ordinal === 23);
     assert.equal(
@@ -357,7 +402,7 @@ int main(void) {
       `${arch}: ws2_32 ordinal 23 must resolve to socket`,
     );
     assert.equal(ws2?.resolved_from_table, true);
-    const unresolved = app.detail.imports
+    const unresolved = [...app.imports, ...app.delay_imports]
       .flatMap((g) => g.symbols)
       .find((s) => s.kind === "ordinal" && s.ordinal === 7);
     assert.equal(
@@ -418,7 +463,7 @@ for (const close of [
 }
 
 if (failures.length > 0)
-  throw new AggregateError(failures, "Binary imports verification failed.");
+  throw new AggregateError(failures, "PE imports verification failed.");
 console.log(
   JSON.stringify(
     {

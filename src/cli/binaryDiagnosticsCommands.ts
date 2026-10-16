@@ -55,7 +55,7 @@ export const registerBinaryDiagnosticsCommands = (
   });
   cli.command(CLI_COMMANDS.inspectPeImports, {
     description:
-      "Triage a PE image's imports: ATT&CK-tagged capabilities, imphash, runtime-resolution hints and packing facts",
+      "Triage a PE image's imports: ATT&CK-tagged capabilities, imphash, runtime-resolution hints, packing facts and the complete import/export tables",
     args: z.object({
       path: z.string().describe("Local PE image (.exe, .dll, .sys)"),
     }),
@@ -64,10 +64,6 @@ export const registerBinaryDiagnosticsCommands = (
         .string()
         .optional()
         .describe("Comma-separated categories (default: the sensitive set)"),
-      detail: z
-        .enum(["summary", "imports"])
-        .optional()
-        .describe('"imports" adds the full import and export tables'),
     }),
     run: ({ args, options }) =>
       withCommandCancellation(async (signal) => {
@@ -89,9 +85,6 @@ export const registerBinaryDiagnosticsCommands = (
                             .map((c) => c.trim())
                             .filter((c) => c.length > 0),
                         }),
-                    ...(options.detail === undefined
-                      ? {}
-                      : { detail: options.detail }),
                   },
                   { signal },
                 ),
