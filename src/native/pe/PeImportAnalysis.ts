@@ -279,6 +279,16 @@ export const analysePeImports = async (
   const resolverImports = new Set<string>();
   const imphash = createHash("md5");
   let imphashParts = 0;
+  // Hash input is batched (one update per ~64 KiB, not per symbol) and the
+  // per-DLL values are computed once per run of symbols from the same DLL.
+  let pendingHash = "";
+  const flushHash = (): void => {
+    if (pendingHash.length > 0) imphash.update(pendingHash);
+    pendingHash = "";
+  };
+  let lastDll: string | null = null;
+  let lastKey = "";
+  let lastLibrary = "";
   const walkLimitations: string[] = [];
   const detailImports: NonNullable<BinaryImportsResult["detail"]>["imports"] =
     [];
@@ -287,10 +297,16 @@ export const analysePeImports = async (
   let detailBytes = 0;
 
   for (const table of ["import", "delay"] as const) {
+    lastDll = null; // the cached key includes the table
     let lastDescriptor = -1;
     const facts = await walkImports(bytes, layout, table, work, (visit) => {
       const dll = visit.dll ?? "";
-      const key = `${table}:${dll.toLowerCase()}`;
+      if (dll !== lastDll) {
+        lastDll = dll;
+        lastKey = `${table}:${dll.toLowerCase()}`;
+        lastLibrary = imphashLibrary(dll);
+      }
+      const key = lastKey;
       const known = dlls.get(key);
       if (known === undefined)
         dlls.set(key, {
@@ -312,10 +328,9 @@ export const analysePeImports = async (
       // pefile hashes the import table only, in descriptor and thunk order,
       // and only the symbols it lists.
       if (table === "import" && name !== null && visit.pefileListed) {
-        imphash.update(
-          `${imphashParts === 0 ? "" : ","}${imphashLibrary(dll)}.${name.toLowerCase()}`,
-        );
+        pendingHash += `${imphashParts === 0 ? "" : ","}${lastLibrary}.${name.toLowerCase()}`;
         imphashParts += 1;
+        if (pendingHash.length >= 65_536) flushHash();
       }
       if (name !== null) {
         const entry = importTaxonomyEntry(name);
@@ -466,7 +481,7 @@ export const analysePeImports = async (
       entry_point_rva: layout.entryPoint,
     },
     taxonomy_version: BINARY_IMPORT_TAXONOMY_VERSION,
-    imphash: imphashParts === 0 ? null : imphash.digest("hex"),
+    imphash: imphashParts === 0 ? null : (flushHash(), imphash.digest("hex")),
     counts,
     categories_scanned: [...categories].sort(),
     capabilities: [...capabilities.entries()]

@@ -49,10 +49,19 @@ const charge = (work: PeWork, units: number): void => {
 };
 
 /** Yield every few thousand entries so an abort can be observed mid-walk. */
-const step = async (work: PeWork): Promise<void> => {
+/**
+ * Count one entry; true when a yield is due. Synchronous, so the per-entry
+ * cost is a counter rather than a promise and microtask.
+ */
+const stepDue = (work: PeWork): boolean => {
   work.sinceYield += 1;
-  if (work.sinceYield < YIELD_INTERVAL) return;
+  if (work.sinceYield < YIELD_INTERVAL) return false;
   work.sinceYield = 0;
+  return true;
+};
+
+/** Yield to the event loop and honour cancellation. */
+const yieldWork = async (work: PeWork): Promise<void> => {
   await setImmediate();
   work.signal?.throwIfAborted();
 };
@@ -109,6 +118,50 @@ const firstPopulatedTable = (
     if (first) return span;
   }
   return null;
+};
+
+/** pefile's function-name charset, as byte codes (letters, digits, `._?@$()<>`). */
+const isPefileNameByte = (byte: number): boolean =>
+  (byte >= 0x30 && byte <= 0x39) ||
+  (byte >= 0x41 && byte <= 0x5a) ||
+  (byte >= 0x61 && byte <= 0x7a) ||
+  byte === 0x2e ||
+  byte === 0x5f ||
+  byte === 0x3f ||
+  byte === 0x40 ||
+  byte === 0x24 ||
+  byte === 0x28 ||
+  byte === 0x29 ||
+  byte === 0x3c ||
+  byte === 0x3e;
+
+/**
+ * How pefile treats a by-name thunk, read in place without allocating:
+ * unreadable (it aborts the descriptor), listed, or skipped as invalid.
+ */
+const pefileNameState = (
+  bytes: Buffer,
+  layout: PeImageLayout,
+  hintRva: number,
+  work: PeWork,
+): "unreadable" | "listed" | "invalid" => {
+  const hint = layout.availableBytes(hintRva);
+  if (hint === null || hint.length < 3) return "unreadable";
+  const span = layout.availableBytes(hintRva + 2);
+  if (span === null) return "unreadable";
+  const limit = Math.min(span.length, PE_NAME_MAX_BYTES);
+  let at = 0;
+  for (; at < limit; at++) {
+    const byte = bytes[span.offset + at]!;
+    if (byte === 0) break;
+    if (!isPefileNameByte(byte)) {
+      charge(work, at + 1);
+      return "invalid";
+    }
+  }
+  charge(work, at + 1);
+  // pefile appends a name only when it is non-empty (`if imp_ord or imp_name`).
+  return at === 0 ? "invalid" : "listed";
 };
 
 export type PeImportedSymbol =
@@ -202,7 +255,7 @@ export const walkImports = async (
   let unusable = 0;
   for (let index = 0; index < maxDescriptors; index++) {
     charge(work, 1);
-    await step(work);
+    if (stepDue(work)) await yieldWork(work);
     const at = span.offset + index * size;
     if (bytes.subarray(at, at + size).every((byte) => byte === 0)) break;
     if (unusable > MAX_UNUSABLE_DESCRIPTORS) {
@@ -250,25 +303,52 @@ export const walkImports = async (
       facts.unreadableDescriptors += 1;
       continue;
     }
-    // Buffered per descriptor: whether pefile lists any of its symbols is only
-    // known once every entry was read (one bad entry aborts the descriptor).
-    const read: { symbol: PeImportedSymbol; listed: boolean }[] = [];
+    const ordinalFlag = thunkWidth === 8 ? 1n << 63n : 1n << 31n;
+    const thunkAt = (t: number): bigint => {
+      const at = thunks.offset + t * thunkWidth;
+      return thunkWidth === 8
+        ? bytes.readBigUInt64LE(at)
+        : BigInt(bytes.readUInt32LE(at));
+    };
+    // Pass 1, allocation-free: does pefile list this descriptor at all? One
+    // unreadable entry aborts it there, and a name outside its function-name
+    // charset is skipped. Streaming in two passes keeps memory flat however
+    // many thunks a descriptor declares.
     let aborted = false;
+    let anyListed = false;
+    for (let t = 0; t < maxThunks; t++) {
+      charge(work, 1);
+      if (stepDue(work)) await yieldWork(work);
+      const value = thunkAt(t);
+      if (value === 0n) break;
+      if ((value & ordinalFlag) !== 0n) {
+        anyListed = true;
+        continue;
+      }
+      const state = pefileNameState(
+        bytes,
+        layout,
+        Number(value & 0x7fffffffn),
+        work,
+      );
+      if (state === "unreadable") {
+        aborted = true;
+        break;
+      }
+      if (state === "listed") anyListed = true;
+    }
+    if (aborted || !anyListed) unusable += 1;
+    // Pass 2: report every entry REA reads, flagging what pefile lists.
     let terminated = false;
     for (let t = 0; t < maxThunks; t++) {
       charge(work, 1);
-      await step(work);
-      const thunkAt = thunks.offset + t * thunkWidth;
-      const value =
-        thunkWidth === 8
-          ? bytes.readBigUInt64LE(thunkAt)
-          : BigInt(bytes.readUInt32LE(thunkAt));
+      if (stepDue(work)) await yieldWork(work);
+      const value = thunkAt(t);
       if (value === 0n) {
         terminated = true;
         break;
       }
       facts.thunks += 1;
-      const ordinalFlag = thunkWidth === 8 ? 1n << 63n : 1n << 31n;
       let symbol: PeImportedSymbol;
       if ((value & ordinalFlag) !== 0n) {
         const ordinal = Number(value & 0xffffn);
@@ -291,19 +371,11 @@ export const walkImports = async (
             ? { kind: "unreadable", rva: hintRva }
             : { kind: "name", name, hint: bytes.readUInt16LE(hintSpan.offset) };
       }
-      // pefile aborts the whole descriptor on an unreadable entry and skips a
-      // name outside its function-name charset.
-      if (symbol.kind === "unreadable") aborted = true;
-      read.push({
-        symbol,
-        listed:
-          symbol.kind === "ordinal" ||
-          (symbol.kind === "name" && PEFILE_FUNCTION_NAME.test(symbol.name)),
-      });
-    }
-    const listedByPefile = !aborted && read.some(({ listed }) => listed);
-    if (!listedByPefile) unusable += 1;
-    for (const { symbol, listed } of read)
+      const listed =
+        symbol.kind === "ordinal" ||
+        (symbol.kind === "name" &&
+          symbol.name !== "" &&
+          PEFILE_FUNCTION_NAME.test(symbol.name));
       visit({
         table,
         descriptor: index,
@@ -311,6 +383,7 @@ export const walkImports = async (
         symbol,
         pefileListed: listed && !aborted,
       });
+    }
     // A lookup table that runs out of section without a terminator is damaged.
     if (!terminated) facts.unreadableDescriptors += 1;
   }
@@ -394,7 +467,7 @@ export const walkExports = async (
   const nameOf = new Map<number, number[]>();
   for (let i = 0; i < names; i++) {
     charge(work, 1);
-    await step(work);
+    if (stepDue(work)) await yieldWork(work);
     const slot = bytes.readUInt16LE((ordinalsSpan?.offset ?? 0) + i * 2);
     if (slot >= functions) {
       unreadable += 1;
@@ -410,7 +483,7 @@ export const walkExports = async (
   let named = 0;
   for (let slot = 0; slot < functions; slot++) {
     charge(work, 1);
-    await step(work);
+    if (stepDue(work)) await yieldWork(work);
     const rva = bytes.readUInt32LE((functionsSpan?.offset ?? 0) + slot * 4);
     if (rva === 0) continue; // an unused ordinal slot
     const ordinal = base + slot;
