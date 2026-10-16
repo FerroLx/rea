@@ -104,9 +104,8 @@ export const binaryImportsResultSchema = z.strictObject({
   taxonomy_version: z.string(),
   /**
    * The import hash exactly as pefile 2024.8.26 computes it (import table only,
-   * delay imports excluded); null when there is no import table, or when a
-   * descriptor is unreadable (pefile discards such a table, so no comparable
-   * hash exists; `counts.unreadable` reports the damage).
+   * delay imports excluded) over the descriptors read: like pefile, an
+   * unusable descriptor is skipped, not fatal. Null when no import is read.
    */
   imphash: z
     .string()
@@ -196,5 +195,6 @@ export const BINARY_IMPORTS_LIMITATIONS: readonly string[] = [
   "Static import-table facts only: no code executes and no instruction is analysed. Capabilities mean the binary imports APIs consistent with a behaviour, not that it performs it.",
   "Confidence tiers weigh signals: weak APIs are imported by ordinary software and the C runtime; argument_dependent APIs depend on arguments static analysis cannot see.",
   "APIs resolved at runtime (GetProcAddress, hashing, syscalls) are not imports; api_strings is a weak, separate hint, and obfuscated names are not found.",
+  "imphash equals pefile's on well-formed tables. Unusable descriptors are skipped as pefile skips them; where pefile discards a damaged table entirely, the imports read here (and so the hash) can differ.",
   "Section entropy and the other packing indicators are facts, not evidence of packing on their own: compressed resources, installers and .NET images also raise them.",
 ];

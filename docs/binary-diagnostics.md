@@ -264,7 +264,12 @@ The image is read once as a stable regular-file snapshot of at most 64 MiB.
 Table walks are bounded by a work budget proportional to the file size;
 exhausting it, or a detail answer above 8 MiB, fails without partial output.
 Malformed tables are reported in `counts` (unreadable entries, unmapped
-delay-load addresses) instead of being guessed. ELF and Mach-O are not yet
+delay-load addresses) instead of being guessed. As in pefile, an unusable
+import descriptor is skipped rather than ending the table, so one planted bad
+descriptor cannot hide the imports after it, and a walk stops once more than
+five descriptors have failed (stated in `limitations`). Where pefile's own
+parser discards a damaged table entirely, REA still reports the imports it can
+read, so on such damaged tables only, `imphash` can differ from pefile. ELF and Mach-O are not yet
 supported.
 
 `npm run verify:binary-imports` builds x86 and x64 mingw-w64 fixtures and

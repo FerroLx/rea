@@ -95,10 +95,21 @@ const charge = (work: PeWork, units: number): void => {
  * that exist, so it is bounded by the file size and not charged to the
  * table-walk budget (which guards amplification, not size).
  */
-const entropy = (bytes: Uint8Array): number => {
+const entropy = async (
+  bytes: Uint8Array,
+  signal: AbortSignal | undefined,
+): Promise<number> => {
   if (bytes.length === 0) return 0;
   const counts = new Uint32Array(256);
-  for (const byte of bytes) counts[byte]! += 1;
+  // Counted per MiB, polling for cancellation between slices.
+  for (let from = 0; from < bytes.length; from += SCAN_YIELD_BYTES) {
+    const to = Math.min(bytes.length, from + SCAN_YIELD_BYTES);
+    for (let at = from; at < to; at++) counts[bytes[at]!]! += 1;
+    if (to < bytes.length) {
+      await setImmediate();
+      signal?.throwIfAborted();
+    }
+  }
   let total = 0;
   for (const count of counts) {
     if (count === 0) continue;
@@ -190,7 +201,13 @@ const scanApiStrings = async (
     for (const alignment of [0, 1]) {
       let runStart = start + alignment;
       let chars = "";
+      let nextYield = start + SCAN_YIELD_BYTES;
       for (let at = start + alignment; at + 1 < end; at += 2) {
+        if (at >= nextYield) {
+          nextYield = at + SCAN_YIELD_BYTES;
+          await setImmediate();
+          work.signal?.throwIfAborted();
+        }
         const low = bytes[at]!;
         if (
           bytes[at + 1] === 0 &&
@@ -254,9 +271,7 @@ export const analysePeImports = async (
   const resolverImports = new Set<string>();
   const imphash = createHash("md5");
   let imphashParts = 0;
-  // pefile discards a damaged import table, so a hash over the descriptors
-  // read here would not pivot against its (or VirusTotal's) imphash.
-  let importTableDamaged = false;
+  const walkLimitations: string[] = [];
   const detailImports: NonNullable<BinaryImportsResult["detail"]>["imports"] =
     [];
   // Detail size is projected while it is collected and refused past the
@@ -348,8 +363,10 @@ export const analysePeImports = async (
       }
     });
     counts.unreadable += facts.unreadableDescriptors;
-    if (table === "import" && facts.unreadableDescriptors > 0)
-      importTableDamaged = true;
+    if (facts.truncatedAfterErrors)
+      walkLimitations.push(
+        `The ${table === "import" ? "import" : "delay-load import"} table was read only until more than five descriptors proved unusable (pefile's rule); later descriptors were not examined.`,
+      );
     if (table === "delay") counts.delay_va_unmapped = facts.delayVaUnmapped;
   }
   for (const key of dlls.keys())
@@ -393,8 +410,9 @@ export const analysePeImports = async (
   let maxEntropy: { section: string; entropy: number } | null = null;
   for (const section of layout.sections) {
     if (section.size === 0) continue;
-    const value = entropy(
+    const value = await entropy(
       bytes.subarray(section.offset, section.offset + section.size),
+      options.signal,
     );
     if (maxEntropy === null || value > maxEntropy.entropy)
       maxEntropy = { section: section.name, entropy: value };
@@ -408,11 +426,12 @@ export const analysePeImports = async (
       : {
           offset: layout.overlay.offset,
           bytes: layout.overlay.size,
-          entropy: entropy(
+          entropy: await entropy(
             bytes.subarray(
               layout.overlay.offset,
               layout.overlay.offset + layout.overlay.size,
             ),
+            options.signal,
           ),
         };
 
@@ -438,8 +457,7 @@ export const analysePeImports = async (
       entry_point_rva: layout.entryPoint,
     },
     taxonomy_version: BINARY_IMPORT_TAXONOMY_VERSION,
-    imphash:
-      imphashParts === 0 || importTableDamaged ? null : imphash.digest("hex"),
+    imphash: imphashParts === 0 ? null : imphash.digest("hex"),
     counts,
     categories_scanned: [...categories].sort(),
     capabilities: [...capabilities.entries()]
@@ -514,7 +532,7 @@ export const analysePeImports = async (
         }
       : null,
     runtime_execution: "not-performed",
-    limitations: [...BINARY_IMPORTS_LIMITATIONS],
+    limitations: [...BINARY_IMPORTS_LIMITATIONS, ...walkLimitations],
   };
   return result;
 };

@@ -101,7 +101,12 @@ export interface PeImportWalkFacts {
   readonly thunks: number;
   /** v0 (VA-based) delay descriptors whose VAs fall outside the image. */
   readonly delayVaUnmapped: number;
+  /** The walk gave up after too many unusable descriptors (as pefile does). */
+  readonly truncatedAfterErrors: boolean;
 }
+
+/** pefile stops an import walk once more than this many descriptors failed. */
+const MAX_UNUSABLE_DESCRIPTORS = 5;
 
 const DESCRIPTOR_SIZE = { import: 20, delay: 32 } as const;
 
@@ -134,6 +139,7 @@ export const walkImports = async (
     unreadableDescriptors: 0,
     thunks: 0,
     delayVaUnmapped: 0,
+    truncatedAfterErrors: false,
   };
   if (directory === null || directory.rva === 0) return facts;
   const span = layout.availableBytes(directory.rva);
@@ -147,11 +153,20 @@ export const walkImports = async (
   // bound the walk: a small declared Size must not hide imports that load.
   const maxDescriptors = Math.floor(span.length / size);
   const thunkWidth = layout.format === "pe32-plus" ? 8 : 4;
+  // pefile's rule: an unusable descriptor is skipped (later valid ones are
+  // still surfaced, so one planted bad descriptor cannot hide them), and the
+  // walk gives up once more than MAX_UNUSABLE_DESCRIPTORS have failed, which
+  // also bounds a table that lacks its all-zero terminator.
+  let unusable = 0;
   for (let index = 0; index < maxDescriptors; index++) {
     charge(work, 1);
     await step(work);
     const at = span.offset + index * size;
     if (bytes.subarray(at, at + size).every((byte) => byte === 0)) break;
+    if (unusable > MAX_UNUSABLE_DESCRIPTORS) {
+      facts.truncatedAfterErrors = true;
+      break;
+    }
     facts.descriptors += 1;
     let nameRva: number;
     let lookupRva: number;
@@ -170,20 +185,18 @@ export const walkImports = async (
       const names = delayField(bytes.readUInt32LE(at + 16), rvaBased, layout);
       if (name === null || names === null) {
         facts.delayVaUnmapped += 1;
-        break; // the end of the usable table, as for an unreadable descriptor
+        unusable += 1;
+        continue;
       }
       nameRva = name;
       lookupRva = names;
     }
     const dll = nameRva === 0 ? null : readName(bytes, layout, nameRva, work);
     const thunks = lookupRva === 0 ? null : layout.availableBytes(lookupRva);
-    // The loader cannot use a descriptor whose DLL name or thunks are not
-    // readable, and pefile treats it as damage: the usable table ends here.
-    // Stopping (rather than skipping) keeps a missing terminator from turning
-    // every following window into a phantom "unreadable" descriptor.
     if (dll === null || thunks === null) {
       facts.unreadableDescriptors += 1;
-      break;
+      unusable += 1;
+      continue;
     }
     const maxThunks = Math.floor(thunks.length / thunkWidth);
     let terminated = false;

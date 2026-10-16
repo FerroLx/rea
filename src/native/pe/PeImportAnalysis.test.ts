@@ -89,15 +89,28 @@ describe("PE import analysis", () => {
     );
   });
 
-  it("ends the import table at the first unreadable descriptor and withholds the imphash", async () => {
-    const bytes = peImportFixture({ imports: [INJECTION] });
-    // Overwrite the terminator and everything after it with non-zero garbage:
-    // no all-zero descriptor remains, and the next one names no readable DLL.
+  it("skips an unusable descriptor and still surfaces later ones, as pefile does", async () => {
+    // [benign DLL][descriptor naming no DLL and no thunks][injection DLL]
+    const bytes = peImportFixture({
+      imports: [["msvcrt.dll", ["printf"]], ["advapi32.dll", []], INJECTION],
+    });
     const descriptorsAt = 0x400;
-    bytes.fill(0xaa, descriptorsAt + 20);
+    bytes.fill(0, descriptorsAt + 20, descriptorsAt + 40);
+    bytes.writeUInt32LE(0x7fff0000, descriptorsAt + 20 + 12); // Name unmapped
     const report = await analyse(bytes);
-    expect(report.counts.imports).toBe(0);
     expect(report.counts.unreadable).toBe(1);
-    expect(report.imphash).toBeNull();
+    expect(report.counts.imports).toBe(4);
+    expect(report.capabilities.map((c) => c.category)).toContain(
+      "process_injection",
+    );
+    expect(report.imphash).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  it("gives up after more than five unusable descriptors when no terminator follows", async () => {
+    const bytes = peImportFixture({ imports: [INJECTION] });
+    bytes.fill(0xaa, 0x400 + 20); // no all-zero descriptor ever follows
+    const report = await analyse(bytes);
+    expect(report.counts.unreadable).toBe(6);
+    expect(report.limitations.at(-1)).toContain("more than five descriptors");
   });
 });
