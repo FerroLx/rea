@@ -199,7 +199,9 @@ An absent resource data directory is a complete empty inventory. Malformed
 headers, truncated tables, cycles, duplicate sibling identities, unbacked or
 ambiguous RVA mappings, nonidentical overlapping ranges and unsupported tree
 shapes fail explicitly, rather than returning partial inventories. Exact shared
-payload ranges are supported. The supported tree has three levels: type, name,
+payload ranges are supported. Section raw data that starts inside
+`SizeOfHeaders` (older UPX images) is accepted as the Windows loader accepts it;
+an RVA inside the headers that a section also covers stays an ambiguous mapping. The supported tree has three levels: type, name,
 and language. Other resource payload formats remain opaque.
 
 `max_file_bytes` defaults to 64 MiB (maximum 512 MiB); `max_entries` defaults to

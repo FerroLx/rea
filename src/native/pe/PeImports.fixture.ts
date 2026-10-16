@@ -15,6 +15,13 @@ interface ImportFixture {
   readonly data?: Buffer;
   /** Minimum section raw size (zero padding), to model large images. */
   readonly sectionBytes?: number;
+  /** Declared SizeOfHeaders (default 0x400, the section's raw offset). */
+  readonly sizeOfHeaders?: number;
+  /**
+   * Declared PointerToRawData, leaving the section's bytes at 0x400 (where a
+   * sector-rounding loader reads them); the file is padded to stay in range.
+   */
+  readonly rawPointer?: number;
 }
 
 /**
@@ -28,6 +35,8 @@ export const peImportFixture = ({
   exports = [],
   data = Buffer.alloc(0),
   sectionBytes = 0,
+  sizeOfHeaders,
+  rawPointer,
 }: ImportFixture) => {
   const SECTION_RVA = 0x2000;
   const RAW = 0x400;
@@ -101,7 +110,9 @@ export const peImportFixture = ({
   const content = Buffer.concat(chunks);
   const rawSize =
     Math.ceil(Math.max(content.length, sectionBytes) / 512) * 512 || 512;
-  const bytes = Buffer.alloc(RAW + rawSize);
+  const bytes = Buffer.alloc(
+    RAW + rawSize + Math.max(0, (rawPointer ?? RAW) - RAW),
+  );
   bytes.writeUInt16LE(0x5a4d, 0);
   bytes.writeUInt32LE(0x80, 60);
   bytes.writeUInt32LE(0x4550, 0x80);
@@ -115,7 +126,7 @@ export const peImportFixture = ({
   bytes.writeUInt32LE(0x1000, optional + 32); // SectionAlignment
   bytes.writeUInt32LE(0x200, optional + 36); // FileAlignment
   bytes.writeUInt32LE(SECTION_RVA + rawSize, optional + 56); // SizeOfImage
-  bytes.writeUInt32LE(RAW, optional + 60); // SizeOfHeaders
+  bytes.writeUInt32LE(sizeOfHeaders ?? RAW, optional + 60); // SizeOfHeaders
   bytes.writeUInt16LE(3, optional + 68); // console subsystem
   bytes.writeUInt32LE(16, optional + 92);
   const directories = optional + 96;
@@ -135,7 +146,7 @@ export const peImportFixture = ({
   bytes.writeUInt32LE(rawSize, section + 8);
   bytes.writeUInt32LE(SECTION_RVA, section + 12);
   bytes.writeUInt32LE(rawSize, section + 16);
-  bytes.writeUInt32LE(RAW, section + 20);
+  bytes.writeUInt32LE(rawPointer ?? RAW, section + 20);
   bytes.writeUInt32LE(0xc0000040, section + 36); // initialised data, R/W
   content.copy(bytes, RAW);
   return bytes;

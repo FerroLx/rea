@@ -64,7 +64,9 @@ const intersectsInterval = (
 /**
  * The single engine-free owner of PE header admission and RVA-to-file mapping.
  * It validates the MZ/PE headers, the optional header and section table, and
- * rejects overlapping raw ranges; then it maps an RVA either to an exact
+ * rejects overlapping section raw ranges (raw data inside SizeOfHeaders is
+ * accepted, as the loader does for older UPX images: header RVAs that a section
+ * also covers are ambiguous mappings); then it maps an RVA either to an exact
  * interval (`map`) or, for null-terminated structures whose length is unknown
  * up front, to the file-backed bytes available from it within its one owning
  * section (`availableBytes`). Ambiguous or missing mappings are failures,
@@ -121,11 +123,7 @@ export const readPeImageLayout = (bytes: Buffer) => {
     };
     if (section.rva + virtualExtent(section) > 0x100000000)
       peFailure("PE section RVA range overflows.");
-    if (section.size > 0) {
-      requirePeRange(bytes, section.offset, section.size);
-      if (section.offset < headerSize)
-        peFailure("PE section raw bytes overlap headers.");
-    }
+    if (section.size > 0) requirePeRange(bytes, section.offset, section.size);
     sections.push(section);
   }
   const backed = sections

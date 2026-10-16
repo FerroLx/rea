@@ -182,3 +182,19 @@ describe("PE import analysis", () => {
     expect(report.imphash).toBe("3597690c8ad7fbfc9f8129219ab36be3");
   });
 });
+
+describe("PE image layouts the loader accepts", () => {
+  it("reads section raw data inside SizeOfHeaders, as the loader does for older UPX images", async () => {
+    const report = await analyse(
+      peImportFixture({
+        imports: [INJECTION],
+        sizeOfHeaders: 0x1000,
+        sectionBytes: 0x1000,
+      }),
+    );
+    expect(report.counts.imports).toBe(3);
+    expect(report.imphash).toBe(
+      (await analyse(peImportFixture({ imports: [INJECTION] }))).imphash,
+    );
+  });
+});
