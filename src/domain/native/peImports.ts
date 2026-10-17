@@ -111,17 +111,34 @@ const authenticodeSigner = z.discriminatedUnion("status", [
     status: z.literal("extracted"),
     /** SHA-256 of the signer certificate's DER encoding. */
     certificate_sha256: digest,
-    /** X.509 names as Node.js renders them; null when it cannot parse them. */
+    /**
+     * X.509 names as Node.js renders them, cut at a code point once their
+     * JSON-escaped UTF-8 form would pass 1 KiB (listed in `truncated`); null
+     * when Node.js cannot parse them. Display text: certificate_sha256 is the
+     * identity.
+     */
     subject: z.string().nullable(),
     issuer: z.string().nullable(),
-    /** The certificate serial number as upper-case hex, without DER sign padding. */
+    /**
+     * The serial number's first 32 value octets as upper-case hex, without
+     * DER sign padding (RFC 5280 allows at most 20).
+     */
     serial_number: z.string(),
+    /** The serial number's value octets, rendered or not. */
+    serial_number_octets: uint,
     /** Certificates embedded in the SignedData (chain and timestamp certificates included). */
     certificates: uint,
     /** SignerInfos declared; Authenticode requires exactly one. */
     signer_infos: uint,
-    /** The signed content type OID (Authenticode: 1.3.6.1.4.1.311.2.1.4). */
+    /**
+     * The signed content type OID (Authenticode: 1.3.6.1.4.1.311.2.1.4), cut
+     * after the last whole arc within 128 characters.
+     */
     content_type: z.string(),
+    /** Fields shortened to their bound, in field order. */
+    truncated: z.array(
+      z.enum(["subject", "issuer", "serial_number", "content_type"]),
+    ),
   }),
   z.strictObject({ status: z.literal("unreadable"), reason: z.string() }),
   /** Not a PKCS_SIGNED_DATA entry: its contents are not examined. */
@@ -161,7 +178,7 @@ const authenticode = z.discriminatedUnion("status", [
     status: z.literal("present"),
     table: certificateTable,
     entries: z.array(winCertificate),
-    /** Entries past the first 64, counted but not listed. */
+    /** Entries past the first 16, counted but not listed. */
     entries_omitted: uint,
     /** File bytes after the table's end: outside it, but not covered by it. */
     bytes_after_table: uint,
@@ -283,17 +300,21 @@ export const peImportsResultSchema = z.strictObject({
       .strictObject({ section: z.string(), entropy: z.number() })
       .nullable(),
     /**
-     * File bytes after the last section's raw data, excluding a well-formed
-     * certificate table (`authenticode.status` "present"): `offset` is the
-     * first such byte, `bytes` and `entropy` cover only those bytes. Null when
-     * nothing but the certificate table follows the sections.
+     * File bytes after the last section's raw data, excluding the signatures
+     * of a well-formed certificate table (`authenticode.status` "present"):
+     * each listed PKCS_SIGNED_DATA entry whose content parsed as SignedData,
+     * through its ContentInfo and the zero padding after it. Other table
+     * bytes (other entry types, unreadable content, non-zero bytes after the
+     * SignedData) stay in. `offset` is the first remaining byte; `bytes` and
+     * `entropy` cover only those bytes. Null when only signatures follow the
+     * sections.
      */
     overlay: z
       .strictObject({
         offset: uint,
         bytes: uint,
         entropy: z.number(),
-        /** Certificate-table bytes inside the overlay, excluded above. */
+        /** Signature bytes of the certificate table inside the overlay, excluded above. */
         certificate_table_bytes: uint,
       })
       .nullable(),

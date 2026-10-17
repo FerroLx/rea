@@ -27,7 +27,11 @@ import {
   walkImports,
 } from "./PeImportTables.js";
 import { pefileImphash } from "./PefileImphash.js";
-import { readPeAuthenticode } from "./PeAuthenticode.js";
+import {
+  PE_AUTHENTICODE_OUTPUT_BYTES,
+  type PeFileExtent,
+  readPeAuthenticode,
+} from "./PeAuthenticode.js";
 
 /** Matched APIs listed per capability (the total is always reported). */
 const CAPABILITY_SAMPLE = 8;
@@ -49,9 +53,14 @@ const PE_IMPORTS_OUTPUT_BYTES = 8 * 1024 * 1024;
  * they are counted rather than refusing the tables.
  */
 const API_STRINGS_OUTPUT_BYTES = PE_API_STRING_HITS_MAX * 128;
-/** What the import, delay-import and export tables may project to. */
+/**
+ * What the import, delay-import and export tables may project to: the ceiling
+ * less the API-string list and the bounded Authenticode facts.
+ */
 export const PE_IMPORT_TABLES_OUTPUT_BYTES =
-  PE_IMPORTS_OUTPUT_BYTES - API_STRINGS_OUTPUT_BYTES;
+  PE_IMPORTS_OUTPUT_BYTES -
+  API_STRINGS_OUTPUT_BYTES -
+  PE_AUTHENTICODE_OUTPUT_BYTES;
 /** Projected serialized bytes per table symbol, before its strings (JSON-escaped at most 2x). */
 const TABLE_SYMBOL_BYTES = 96;
 
@@ -134,35 +143,30 @@ const entropy = async (
 };
 
 /**
- * The overlay (file bytes after the last section's raw data) without a
- * well-formed certificate table, which is normally the file's tail. A
- * malformed table excludes nothing: its declared extent is not trusted.
+ * The overlay (file bytes after the last section's raw data) without the
+ * certificate table's signatures, which are normally the file's tail. Other
+ * table bytes stay in; a malformed table yields no signatures.
  */
 const overlayFacts = async (
   bytes: Buffer,
   overlay: { readonly offset: number; readonly size: number },
-  authenticode: PeImportsResult["authenticode"],
+  signatures: readonly PeFileExtent[],
   signal: AbortSignal | undefined,
 ): Promise<PeImportsResult["packing"]["overlay"]> => {
-  const start = overlay.offset;
   const end = overlay.offset + overlay.size;
-  let ranges: [number, number][] = [[start, end]];
+  const ranges: [number, number][] = [];
+  let at = overlay.offset;
   let certificateBytes = 0;
-  if (authenticode.status === "present") {
-    const from = Math.max(start, authenticode.table.offset);
-    const to = Math.min(
-      end,
-      authenticode.table.offset + authenticode.table.size,
-    );
-    if (from < to) {
-      certificateBytes = to - from;
-      ranges = [
-        [start, from],
-        [to, end],
-      ];
-    }
+  // Signatures are disjoint and in file order.
+  for (const signature of signatures) {
+    const from = Math.max(at, signature.offset);
+    const to = Math.min(end, signature.end);
+    if (from >= to) continue;
+    if (from > at) ranges.push([at, from]);
+    certificateBytes += to - from;
+    at = to;
   }
-  ranges = ranges.filter(([from, to]) => to > from);
+  if (end > at) ranges.push([at, end]);
   const first = ranges[0];
   if (first === undefined) return null;
   return {
@@ -539,11 +543,11 @@ export const analysePeImports = async (
   // intelligence pivots on it even where it differs from what the loader binds.
   const imphash = await pefileImphash(bytes, layout, work);
   const importCount = counts.imports + counts.delay_imports;
-  const authenticode = readPeAuthenticode(bytes, layout);
+  const { facts: authenticode, signatures } = readPeAuthenticode(bytes, layout);
   const overlay = await overlayFacts(
     bytes,
     layout.overlay,
-    authenticode,
+    signatures,
     options.signal,
   );
 

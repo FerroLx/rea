@@ -265,9 +265,16 @@ inline source. The triage facts, present in both forms, are:
   whose address is a file offset rather than an RVA. `absent` means no table
   is declared; `present` gives the table's offset and size, the bytes after
   it, and each `WIN_CERTIFICATE` (offset, length, revision, type such as
-  `PKCS_SIGNED_DATA`). For a `PKCS_SIGNED_DATA` entry, the signer certificate
-  located by the first SignerInfo's issuer and serial number is reported with
-  its DER SHA-256, subject, issuer and serial number. A table or entry that
+  `PKCS_SIGNED_DATA`); the first 16 entries are listed and later ones counted
+  in `entries_omitted` (real images carry one). For a `PKCS_SIGNED_DATA`
+  entry, the signer certificate located by the first SignerInfo's issuer and
+  serial number is reported with its exact DER SHA-256 (its identity), subject,
+  issuer, serial number and content type. These display values are bounded so
+  the whole `authenticode` object stays under 49 KiB in complete and summary
+  delivery: `serial_number` renders at most 32 value octets (RFC 5280 allows 20) with the full count in `serial_number_octets`, each name is cut at a
+  code point once its JSON-escaped UTF-8 form would pass 1 KiB, the
+  content-type OID keeps whole arcs within 128 characters, and `truncated`
+  lists every field that was shortened. A table or entry that
   leaves the file, or a declared zero offset or size, is `malformed` with the
   reason and the entries read before it, never `absent`. Nothing is verified:
   `verification` is always `not-performed` and `trust` `not-assessed`, so a
@@ -275,9 +282,13 @@ inline source. The triage facts, present in both forms, are:
   signatures and timestamps inside unsigned attributes are not examined.
 - `packing`: entry-point section, writable+executable sections, zero-raw large
   virtual sections, the highest section entropy and the overlay. The overlay
-  excludes a `present` certificate table (normally the file's tail) and
-  reports its size as `certificate_table_bytes`; it is null when only the
-  table follows the sections. A malformed table excludes nothing.
+  excludes the signatures of a `present` certificate table (normally the
+  file's tail): each listed `PKCS_SIGNED_DATA` entry whose content parses as
+  SignedData, from its header through the SignedData and the zero padding
+  after it, reported as `certificate_table_bytes`. Other table bytes stay in
+  the overlay and its entropy: entries of other types, content that is not
+  SignedData and non-zero bytes after a SignedData. The overlay is null when
+  only signatures follow the sections. A malformed table excludes nothing.
 - `format`: architecture, subsystem, DLL and .NET flags.
 
 The complete result adds `imports` and `delay_imports` (one entry per
@@ -285,7 +296,8 @@ descriptor, with ordinal imports resolved through pefile's ordinal tables,
 `ord<N>` otherwise), `exports` (with forwarders) and `api_strings` (every listed
 API-string hit with its file offset and encoding, in scan order). At most 8,192
 hits are listed: each serializes to at most 128 bytes, so the list is reserved
-1 MiB of the 8 MiB complete-result ceiling, leaving 7 MiB for the tables. Hits
+1 MiB of the 8 MiB complete-result ceiling and `authenticode` its 49 KiB
+bound, leaving the rest (just under 7 MiB) for the tables. Hits
 past it are counted in `omitted` and stated in `limitations`. After a summary,
 page these collections with `inspect_analysis_view`:
 
@@ -317,7 +329,7 @@ and are not found.
 
 The image is read once as a stable regular-file snapshot of at most 64 MiB.
 Table walks are bounded by a work budget proportional to the file size;
-exhausting it, or tables that would serialise above 7 MiB, fails without
+exhausting it, or tables that would serialise past their share of the ceiling, fails without
 partial output.
 Malformed tables are reported in `counts` (unreadable entries, unmapped
 delay-load addresses) instead of being guessed. As in pefile, an unusable

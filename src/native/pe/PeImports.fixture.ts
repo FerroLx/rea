@@ -86,6 +86,99 @@ export const FIXTURE_SIGNED_DATA = Buffer.from(
 export const FIXTURE_SIGNER_SHA256 =
   "0f3e2b9f4b1f676dfbea49c1689820c3a05840f92fc7765805ce205cbba147e5";
 
+const derLength = (length: number): Buffer => {
+  if (length < 0x80) return Buffer.from([length]);
+  const octets: number[] = [];
+  for (let rest = length; rest > 0; rest = Math.floor(rest / 256))
+    octets.unshift(rest % 256);
+  return Buffer.from([0x80 | octets.length, ...octets]);
+};
+const der = (tag: number, ...parts: readonly Buffer[]): Buffer => {
+  const content = Buffer.concat(parts);
+  return Buffer.concat([
+    Buffer.from([tag]),
+    derLength(content.length),
+    content,
+  ]);
+};
+const derOid = (hex: string): Buffer => der(0x06, Buffer.from(hex, "hex"));
+/** A Name of one organizationalUnitName RDN. */
+const derName = (value: string): Buffer =>
+  der(
+    0x30,
+    der(0x31, der(0x30, derOid("55040b"), der(0x0c, Buffer.from(value)))),
+  );
+
+/**
+ * A structurally valid PKCS #7 SignedData whose one SignerInfo names an
+ * embedded, unsigned certificate (`certificate`, its DER) by issuer and
+ * serial. The certificate reuses the fixture leaf's P-256 key; its signature
+ * is a placeholder, since nothing is verified. `serial` is the INTEGER's
+ * content octets and `contentType` the encapsulated OID's content octets.
+ */
+export const craftedSignedData = ({
+  serial,
+  subject,
+  issuer,
+  contentType = Buffer.from("2b060104018237020104", "hex"),
+}: {
+  readonly serial: Buffer;
+  readonly subject: string;
+  readonly issuer: string;
+  readonly contentType?: Buffer;
+}): { readonly signedData: Buffer; readonly certificate: Buffer } => {
+  const ecdsaSha256 = der(0x30, derOid("2a8648ce3d040302"));
+  const sha256 = der(0x30, derOid("608648016503040201"));
+  const time = der(0x17, Buffer.from("260101000000Z"));
+  const serialNumber = der(0x02, serial);
+  const issuerName = derName(issuer);
+  const spki = Buffer.from(
+    "3059301306072a8648ce3d020106082a8648ce3d030107034200041adc9b693d84f3e4" +
+      "0dc3a9d91f55e07d1c8b074e72d33511833492f3396226e1ab960aca49a984679be7" +
+      "067dafbe25b3ed8f10a4d227e192507a12b444d595cd",
+    "hex",
+  );
+  const certificate = der(
+    0x30,
+    der(
+      0x30,
+      der(0xa0, der(0x02, Buffer.from([2]))),
+      serialNumber,
+      ecdsaSha256,
+      issuerName,
+      der(0x30, time, time),
+      derName(subject),
+      spki,
+    ),
+    ecdsaSha256,
+    der(0x03, Buffer.from([0, 0])),
+  );
+  const signerInfo = der(
+    0x30,
+    der(0x02, Buffer.from([1])),
+    der(0x30, issuerName, serialNumber),
+    sha256,
+    ecdsaSha256,
+    der(0x04, Buffer.from([0])),
+  );
+  const signedData = der(
+    0x30,
+    derOid("2a864886f70d010702"),
+    der(
+      0xa0,
+      der(
+        0x30,
+        der(0x02, Buffer.from([1])),
+        der(0x31, sha256),
+        der(0x30, der(0x06, contentType)),
+        der(0xa0, certificate),
+        der(0x31, signerInfo),
+      ),
+    ),
+  );
+  return { signedData, certificate };
+};
+
 /** One WIN_CERTIFICATE (dwLength, wRevision, wCertificateType), padded to 8 bytes. */
 export const winCertificate = (
   payload: Buffer,

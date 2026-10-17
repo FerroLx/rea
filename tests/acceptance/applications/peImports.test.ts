@@ -7,6 +7,7 @@ import { expect } from "vitest";
 import { toolContract } from "../../../src/contracts/toolContracts.js";
 import { peImportsResultSchema } from "../../../src/domain/native/peImports.js";
 import {
+  craftedSignedData,
   FIXTURE_SIGNED_DATA,
   FIXTURE_SIGNER_SHA256,
   peImportFixture,
@@ -249,6 +250,90 @@ const expectSummaryAndPages = async (
   expect(wrongKind.isError).toBe(true);
 };
 
+/**
+ * A signature with a 300 KB serial and long names stays a fixed-size fact in
+ * complete and summary delivery, and bytes parked in a non-signature
+ * certificate-table entry stay in the overlay.
+ */
+const expectBoundedAuthenticodeAcrossAdapters = async (
+  cli: TestCli,
+  client: Client,
+  root: string,
+) => {
+  const serial = Buffer.concat([
+    Buffer.from([0x7f]),
+    Buffer.alloc(300_000, 0xcd),
+  ]);
+  const { signedData, certificate } = craftedSignedData({
+    serial,
+    subject: "S".repeat(4000),
+    issuer: "I".repeat(4000),
+  });
+  const signature = winCertificate(signedData);
+  const parked = winCertificate(
+    Buffer.from("HIDDEN_INSIDE_FAKE_CERT_TABLE_".repeat(60)),
+    { type: 0x1000 },
+  );
+  const bytes = peImportFixture({
+    certificateTable: { table: Buffer.concat([signature, parked]) },
+  });
+  const path = join(root, "crafted-signature.exe");
+  await writeFile(path, bytes);
+  const result = await cli.run({
+    arguments: ["inspect-pe-imports", path, "--json"],
+  });
+  expect(result.exitCode).toBe(0);
+  const evidence = contract.outputSchema.parse(result.json);
+  const report = peImportsResultSchema.parse(evidence.normalized_result);
+  expect(report.authenticode).toMatchObject({
+    status: "present",
+    entries: [
+      {
+        type_name: "PKCS_SIGNED_DATA",
+        signer: {
+          status: "extracted",
+          certificate_sha256: createHash("sha256")
+            .update(certificate)
+            .digest("hex"),
+          subject: `OU=${"S".repeat(1021)}`,
+          issuer: `OU=${"I".repeat(1021)}`,
+          serial_number: `7F${"CD".repeat(31)}`,
+          serial_number_octets: serial.length,
+          content_type: "1.3.6.1.4.1.311.2.1.4",
+          truncated: ["subject", "issuer", "serial_number"],
+        },
+      },
+      {
+        type: 0x1000,
+        type_name: "unknown",
+        signer: { status: "not-examined" },
+      },
+    ],
+  });
+  expect(JSON.stringify(report.authenticode).length).toBeLessThan(4096);
+  expect(report.packing.overlay).toMatchObject({
+    offset: bytes.length - parked.length,
+    bytes: parked.length,
+    certificate_table_bytes: signature.length,
+  });
+  expect(report.packing.overlay?.entropy).toBeGreaterThan(3);
+  const response = await client.callTool({
+    name: contract.name,
+    arguments: { path, detail: "summary" },
+  });
+  expect(response.isError).not.toBe(true);
+  expect(JSON.stringify(response.structuredContent).length).toBeLessThan(
+    32 * 1024,
+  );
+  const summary = contract.outputSchema.parse(
+    response.structuredContent,
+  ).normalized_result;
+  if (!("kind" in summary) || summary.kind !== "summary")
+    throw new Error("summary detail must return a summary view");
+  expect(summary.summary.authenticode).toEqual(report.authenticode);
+  expect(summary.summary.packing.overlay).toEqual(report.packing.overlay);
+};
+
 const expectInputFailuresAcrossAdapters = async (
   cli: TestCli,
   client: Client,
@@ -337,6 +422,7 @@ cliTest(
         bytes,
       );
       await expectSummaryAndPages(client, path, report);
+      await expectBoundedAuthenticodeAcrossAdapters(cli, client, root);
       await expectInputFailuresAcrossAdapters(cli, client, root);
       expect(await readFile(path)).toEqual(bytes);
       await client.ping();

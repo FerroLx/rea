@@ -9,12 +9,38 @@ type WinCertificate = Extract<
   { status: "present" }
 >["entries"][number];
 type Signer = WinCertificate["signer"];
+type Truncated = Extract<Signer, { status: "extracted" }>["truncated"][number];
 
 /** IMAGE_DIRECTORY_ENTRY_SECURITY. */
 const SECURITY_DIRECTORY = 4;
 const WIN_CERTIFICATE_HEADER = 8;
-/** WIN_CERTIFICATE entries listed; real images carry one. */
-const ENTRY_SAMPLE = 64;
+/**
+ * WIN_CERTIFICATE entries listed; real images carry one (further signatures
+ * nest inside its unsigned attributes). Later entries are counted.
+ */
+const ENTRY_SAMPLE = 16;
+/**
+ * Serial-number octets rendered. RFC 5280 4.1.2.2 caps conforming serials at
+ * 20 octets; the margin covers non-conforming CAs, and longer values keep
+ * their octet count.
+ */
+const SERIAL_OCTETS_MAX = 32;
+/** UTF-8 bytes of a JSON-escaped subject or issuer string kept per name. */
+const NAME_BYTES_MAX = 1024;
+/** Characters of the dotted content-type OID kept. */
+const OID_CHARS_MAX = 128;
+/**
+ * Serialized bytes one listed entry can reach: two names at NAME_BYTES_MAX, a
+ * 64-character serial, a 128-character OID, a digest, every truncation marker
+ * and 32-bit integers, with keys and punctuation.
+ */
+const ENTRY_OUTPUT_BYTES = 3 * 1024;
+/**
+ * Most bytes `authenticode` can serialize to: listed entries plus the table,
+ * counts and a fixed-form reason. The complete result reserves it.
+ */
+export const PE_AUTHENTICODE_OUTPUT_BYTES =
+  ENTRY_SAMPLE * ENTRY_OUTPUT_BYTES + 1024;
 const TYPE_NAMES: Readonly<Record<number, WinCertificate["type_name"]>> = {
   1: "X509",
   2: "PKCS_SIGNED_DATA",
@@ -88,8 +114,12 @@ const children = (bytes: Buffer, parent: Tlv): Tlv[] => {
   return out;
 };
 
-const decodeOid = (bytes: Buffer, tlv: Tlv): string => {
-  const arcs: number[] = [];
+/** Dotted OID, cut at the last whole arc within OID_CHARS_MAX characters. */
+const decodeOid = (
+  bytes: Buffer,
+  tlv: Tlv,
+): { text: string; truncated: boolean } => {
+  let text = "";
   let value = 0;
   for (let at = tlv.content; at < tlv.end; at++) {
     const byte = bytes[at]!;
@@ -97,16 +127,20 @@ const decodeOid = (bytes: Buffer, tlv: Tlv): string => {
     if (value > Number.MAX_SAFE_INTEGER / 128)
       throw new DerFailure("OID arc overflows");
     if ((byte & 0x80) === 0) {
-      if (arcs.length === 0) {
+      let arc: string;
+      if (text === "") {
         const top = value < 40 ? 0 : value < 80 ? 1 : 2;
-        arcs.push(top, value - top * 40);
-      } else arcs.push(value);
+        arc = `${String(top)}.${String(value - top * 40)}`;
+      } else arc = `.${String(value)}`;
+      if (text.length + arc.length > OID_CHARS_MAX)
+        return { text, truncated: true };
+      text += arc;
       value = 0;
     }
   }
-  if (arcs.length === 0 || (bytes[tlv.end - 1]! & 0x80) !== 0)
+  if (text === "" || (bytes[tlv.end - 1]! & 0x80) !== 0)
     throw new DerFailure("malformed OID");
-  return arcs.join(".");
+  return { text, truncated: false };
 };
 
 const same = (bytes: Buffer, left: Tlv, right: Tlv): boolean =>
@@ -135,32 +169,72 @@ const certificateIdentity = (
   return { serial, issuer };
 };
 
-/** An INTEGER's value as upper-case hex, without its DER sign-padding byte. */
-const integerHex = (bytes: Buffer, integer: Tlv): string => {
+/**
+ * An INTEGER's value octets (without the DER sign-padding byte) and the first
+ * SERIAL_OCTETS_MAX of them as upper-case hex.
+ */
+const serialNumber = (
+  bytes: Buffer,
+  integer: Tlv,
+): { hex: string; octets: number } => {
   const padded =
     integer.end - integer.content > 1 &&
     bytes[integer.content] === 0 &&
     bytes[integer.content + 1]! >= 0x80;
-  return bytes
-    .subarray(integer.content + (padded ? 1 : 0), integer.end)
-    .toString("hex")
-    .toUpperCase();
+  const from = integer.content + (padded ? 1 : 0);
+  return {
+    hex: bytes
+      .subarray(from, Math.min(integer.end, from + SERIAL_OCTETS_MAX))
+      .toString("hex")
+      .toUpperCase(),
+    octets: integer.end - from,
+  };
 };
 
-const nodeName = (read: () => string): string | null => {
+/** The longest whole-code-point prefix whose JSON escaping fits NAME_BYTES_MAX. */
+const boundedName = (value: string): { text: string; truncated: boolean } => {
+  // A UTF-16 code unit escapes to at most 6 bytes ("\u001f").
+  if (value.length * 6 <= NAME_BYTES_MAX)
+    return { text: value, truncated: false };
+  let bytes = 0;
+  let end = 0;
+  for (const point of value) {
+    bytes += Buffer.byteLength(JSON.stringify(point)) - 2;
+    if (bytes > NAME_BYTES_MAX)
+      return { text: value.slice(0, end), truncated: true };
+    end += point.length;
+  }
+  return { text: value, truncated: false };
+};
+
+/** A name Node.js renders, bounded; null when it cannot render it. */
+const nodeName = (
+  read: () => string,
+): { text: string | null; truncated: boolean } => {
   try {
-    return read();
+    return boundedName(read());
   } catch {
-    return null;
+    return { text: null, truncated: false };
   }
 };
+
+/**
+ * A PKCS_SIGNED_DATA entry's signer, and where its ContentInfo ends when it
+ * parsed as SignedData (null otherwise).
+ */
+interface SignerRead {
+  readonly signer: Signer;
+  readonly signedDataEnd: number | null;
+}
 
 /**
  * Locate the signer certificate of a PKCS #7 SignedData by its first
  * SignerInfo's IssuerAndSerialNumber. Linear in the entry's bytes; it reads
  * structure only and checks no signature or digest.
  */
-const readSigner = (bytes: Buffer, from: number, to: number): Signer => {
+const readSigner = (bytes: Buffer, from: number, to: number): SignerRead => {
+  let signedDataEnd: number | null = null;
+  const result = (signer: Signer): SignerRead => ({ signer, signedDataEnd });
   try {
     const info = expectTag(bytes, from, to, 0x30, "ContentInfo");
     const oid = expectTag(bytes, info.content, info.end, 0x06, "contentType");
@@ -179,6 +253,7 @@ const readSigner = (bytes: Buffer, from: number, to: number): Signer => {
     const encapsulated = fields[2];
     if (fields[0]?.tag !== 0x02 || encapsulated?.tag !== 0x30)
       throw new DerFailure("malformed SignedData");
+    signedDataEnd = info.end;
     const contentType = expectTag(
       bytes,
       encapsulated.content,
@@ -194,7 +269,10 @@ const readSigner = (bytes: Buffer, from: number, to: number): Signer => {
     const signers = children(bytes, signerInfos);
     const first = signers[0];
     if (first === undefined)
-      return { status: "unreadable", reason: "SignedData has no SignerInfo." };
+      return result({
+        status: "unreadable",
+        reason: "SignedData has no SignerInfo.",
+      });
     const sid = children(
       bytes,
       expectTag(bytes, first.start, first.end, 0x30, "SignerInfo"),
@@ -202,11 +280,11 @@ const readSigner = (bytes: Buffer, from: number, to: number): Signer => {
     if (sid?.tag !== 0x30 && sid?.tag !== 0x80)
       throw new DerFailure("malformed SignerInfo identifier");
     if (sid.tag === 0x80)
-      return {
+      return result({
         status: "unreadable",
         reason:
           "The SignerInfo identifies its signer by subjectKeyIdentifier, which is not matched.",
-      };
+      });
     const [issuer, serial] = children(bytes, sid);
     if (issuer?.tag !== 0x30 || serial?.tag !== 0x02)
       throw new DerFailure("malformed IssuerAndSerialNumber");
@@ -226,11 +304,11 @@ const readSigner = (bytes: Buffer, from: number, to: number): Signer => {
       }
     });
     if (leaf === undefined)
-      return {
+      return result({
         status: "unreadable",
         reason:
           "No embedded certificate matches the SignerInfo's issuer and serial number.",
-      };
+      });
     const der = bytes.subarray(leaf.start, leaf.end);
     let parsed: X509Certificate | null = null;
     try {
@@ -238,49 +316,92 @@ const readSigner = (bytes: Buffer, from: number, to: number): Signer => {
     } catch {
       parsed = null;
     }
-    return {
+    const unnamed = { text: null, truncated: false };
+    const subject = parsed === null ? unnamed : nodeName(() => parsed.subject);
+    const issuerName =
+      parsed === null ? unnamed : nodeName(() => parsed.issuer);
+    const number = serialNumber(bytes, serial);
+    const type = decodeOid(bytes, contentType);
+    const truncated: Truncated[] = [];
+    if (subject.truncated) truncated.push("subject");
+    if (issuerName.truncated) truncated.push("issuer");
+    if (number.octets > SERIAL_OCTETS_MAX) truncated.push("serial_number");
+    if (type.truncated) truncated.push("content_type");
+    return result({
       status: "extracted",
       certificate_sha256: createHash("sha256").update(der).digest("hex"),
-      subject: parsed === null ? null : nodeName(() => parsed.subject),
-      issuer: parsed === null ? null : nodeName(() => parsed.issuer),
-      serial_number: integerHex(bytes, serial),
+      subject: subject.text,
+      issuer: issuerName.text,
+      serial_number: number.hex,
+      serial_number_octets: number.octets,
       certificates: embedded.length,
       signer_infos: signers.length,
-      content_type: decodeOid(bytes, contentType),
-    };
+      content_type: type.text,
+      truncated,
+    });
   } catch (cause) {
     if (cause instanceof DerFailure)
-      return {
+      return result({
         status: "unreadable",
         reason: `SignedData is not readable DER: ${cause.message}.`,
-      };
+      });
     throw cause;
   }
+};
+
+/** A file range [offset, end). */
+export interface PeFileExtent {
+  readonly offset: number;
+  readonly end: number;
+}
+
+export interface PeAuthenticodeRead {
+  readonly facts: Authenticode;
+  /**
+   * Certificate-table ranges that hold a signature, in file order: each
+   * listed PKCS_SIGNED_DATA entry whose content parsed as SignedData, from its
+   * header to its ContentInfo's end plus the zero bytes that follow it up to
+   * the entry's quadword alignment. Other bytes in the table are not a
+   * signature, and a malformed table yields none.
+   */
+  readonly signatures: readonly PeFileExtent[];
+}
+
+/** The end of the zero run in [from, limit). */
+const zeroRunEnd = (bytes: Buffer, from: number, limit: number): number => {
+  let at = from;
+  while (at < limit && bytes[at] === 0) at++;
+  return at;
 };
 
 /**
  * Authenticode certificate-table facts. The security directory's
  * VirtualAddress is a file offset; the table and every WIN_CERTIFICATE in it
  * are bounds-checked against the file. A defect yields `malformed` with the
- * entries read before it, never `absent`. Nothing is verified.
+ * entries read before it, never `absent`. Nothing is verified. The facts
+ * serialize to at most PE_AUTHENTICODE_OUTPUT_BYTES.
  */
 export const readPeAuthenticode = (
   bytes: Buffer,
   layout: PeImageLayout,
-): Authenticode => {
+): PeAuthenticodeRead => {
   const directory = layout.dataDirectory(SECURITY_DIRECTORY);
   if (directory === null || (directory.rva === 0 && directory.size === 0))
-    return { status: "absent" };
+    return { facts: { status: "absent" }, signatures: [] };
   const table = { offset: directory.rva, size: directory.size };
   const entries: WinCertificate[] = [];
+  const signatures: PeFileExtent[] = [];
   let omitted = 0;
-  const malformed = (reason: string): Authenticode => ({
-    status: "malformed",
-    table,
-    reason,
-    entries,
-    entries_omitted: omitted,
-    ...NOT_VERIFIED,
+  const malformed = (reason: string): PeAuthenticodeRead => ({
+    facts: {
+      status: "malformed",
+      table,
+      reason,
+      entries,
+      entries_omitted: omitted,
+      ...NOT_VERIFIED,
+    },
+    signatures: [],
   });
   if (table.offset === 0 || table.size === 0)
     return malformed(
@@ -305,32 +426,42 @@ export const readPeAuthenticode = (
       return malformed(
         `The WIN_CERTIFICATE at file offset ${String(at)} declares dwLength ${String(length)}, past the ${declaredEnd > bytes.length ? "file" : "certificate table"}.`,
       );
-    if (entries.length < ENTRY_SAMPLE)
+    // Entries are quadword aligned; the last one's padding may be absent.
+    const next = Math.min(end, at + length + ((8 - (length % 8)) % 8));
+    if (entries.length < ENTRY_SAMPLE) {
+      const read =
+        type === 2
+          ? readSigner(bytes, at + WIN_CERTIFICATE_HEADER, at + length)
+          : null;
       entries.push({
         offset: at,
         length,
         revision,
         type,
         type_name: TYPE_NAMES[type] ?? "unknown",
-        signer:
-          type === 2
-            ? readSigner(bytes, at + WIN_CERTIFICATE_HEADER, at + length)
-            : { status: "not-examined" },
+        signer: read?.signer ?? { status: "not-examined" },
       });
-    else omitted += 1;
-    // Entries are quadword aligned; the last one's padding may be absent.
-    at += length + ((8 - (length % 8)) % 8);
+      if (read !== null && read.signedDataEnd !== null)
+        signatures.push({
+          offset: at,
+          end: zeroRunEnd(bytes, read.signedDataEnd, next),
+        });
+    } else omitted += 1;
+    at = next;
   }
   if (declaredEnd > bytes.length)
     return malformed(
       `The certificate table (file offset ${String(table.offset)}, ${String(table.size)} bytes) leaves the ${String(bytes.length)}-byte file.`,
     );
   return {
-    status: "present",
-    table,
-    entries,
-    entries_omitted: omitted,
-    bytes_after_table: bytes.length - declaredEnd,
-    ...NOT_VERIFIED,
+    facts: {
+      status: "present",
+      table,
+      entries,
+      entries_omitted: omitted,
+      bytes_after_table: bytes.length - declaredEnd,
+      ...NOT_VERIFIED,
+    },
+    signatures,
   };
 };

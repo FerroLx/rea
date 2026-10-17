@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
+import { PE_AUTHENTICODE_OUTPUT_BYTES } from "./PeAuthenticode.js";
 import { analysePeImports } from "./PeImportAnalysis.js";
 import {
+  craftedSignedData,
   FIXTURE_SIGNED_DATA,
   FIXTURE_SIGNER_SHA256,
   peImportFixture,
@@ -42,9 +44,11 @@ describe("PE Authenticode certificate table", () => {
             subject: "O=REA Tests\nCN=REA Fixture Signer",
             issuer: "O=REA Tests\nCN=REA Fixture Root",
             serial_number: "C0FFEE01",
+            serial_number_octets: 4,
             certificates: 2,
             signer_infos: 1,
             content_type: "1.3.6.1.4.1.311.2.1.4",
+            truncated: [],
           },
         },
       ],
@@ -192,6 +196,138 @@ describe("PE Authenticode signer", () => {
           },
         },
       ],
+    });
+  });
+});
+
+/** UTF-8 bytes of a value's JSON encoding. */
+const jsonBytes = (value: unknown): number =>
+  Buffer.byteLength(JSON.stringify(value));
+
+describe("PE Authenticode output bounds", () => {
+  // Each code point escapes to its widest JSON form: a control character
+  // Node.js renders as "\\01", a quote, and multi-byte UTF-8.
+  const wide = '\u0001"\u00e9\u{1f600}'.repeat(2000);
+
+  it("bounds the serial, names and content type while the certificate digest stays exact", async () => {
+    const serial = Buffer.concat([
+      Buffer.from([0x7f]),
+      Buffer.alloc(300_000, 0xcd),
+    ]);
+    const { signedData, certificate } = craftedSignedData({
+      serial,
+      subject: wide,
+      issuer: "x".repeat(5000),
+      // 200 arcs of 1.2.<127>...: far past the rendered bound.
+      contentType: Buffer.concat([
+        Buffer.from([0x2a]),
+        Buffer.alloc(200, 0x7f),
+      ]),
+    });
+    const report = await analyse(
+      peImportFixture({
+        certificateTable: { table: winCertificate(signedData) },
+      }),
+    );
+    if (report.authenticode.status !== "present")
+      throw new Error("expected a present certificate table");
+    const signer = report.authenticode.entries[0]?.signer;
+    if (signer?.status !== "extracted")
+      throw new Error("expected an extracted signer");
+    expect(signer.certificate_sha256).toBe(
+      createHash("sha256").update(certificate).digest("hex"),
+    );
+    expect(signer.serial_number).toBe(`7F${"CD".repeat(31)}`);
+    expect(signer.serial_number_octets).toBe(serial.length);
+    expect(signer.truncated).toEqual([
+      "subject",
+      "issuer",
+      "serial_number",
+      "content_type",
+    ]);
+    expect(signer.subject?.startsWith('OU=\\01\\"\u00e9\u{1f600}')).toBe(true);
+    expect(jsonBytes(signer.subject)).toBeLessThanOrEqual(1026);
+    expect(jsonBytes(signer.subject)).toBeGreaterThan(1000);
+    expect(signer.issuer).toBe(`OU=${"x".repeat(1021)}`);
+    expect(signer.content_type).toMatch(/^1\.2(\.127)+$/);
+    expect(signer.content_type.length).toBeLessThanOrEqual(128);
+    expect(jsonBytes(report.authenticode)).toBeLessThan(4096);
+  });
+
+  it("keeps a table of maximal entries within the reserved output", async () => {
+    const { signedData } = craftedSignedData({
+      serial: Buffer.alloc(33, 0x7f),
+      subject: wide,
+      issuer: wide,
+      contentType: Buffer.concat([
+        Buffer.from([0x2a]),
+        Buffer.alloc(200, 0x7f),
+      ]),
+    });
+    const entries = 20;
+    const report = await analyse(
+      peImportFixture({
+        certificateTable: {
+          table: Buffer.concat(
+            Array.from({ length: entries }, () => winCertificate(signedData)),
+          ),
+        },
+      }),
+    );
+    if (report.authenticode.status !== "present")
+      throw new Error("expected a present certificate table");
+    expect(report.authenticode.entries).toHaveLength(16);
+    expect(report.authenticode.entries_omitted).toBe(entries - 16);
+    expect(
+      report.authenticode.entries.every(
+        ({ signer }) =>
+          signer.status === "extracted" && signer.truncated.length === 4,
+      ),
+    ).toBe(true);
+    expect(jsonBytes(report.authenticode)).toBeLessThanOrEqual(
+      PE_AUTHENTICODE_OUTPUT_BYTES,
+    );
+  });
+});
+
+describe("PE overlay around the certificate table", () => {
+  it("excludes only SignedData entries and keeps other table bytes in the overlay", async () => {
+    const hidden = Buffer.from("HIDDEN_INSIDE_FAKE_CERT_TABLE_".repeat(60));
+    const signature = winCertificate(FIXTURE_SIGNED_DATA);
+    const fake = winCertificate(hidden, { type: 0x1000 });
+    const garbage = winCertificate(Buffer.alloc(16, 0xaa));
+    const bytes = peImportFixture({
+      certificateTable: { table: Buffer.concat([signature, fake, garbage]) },
+    });
+    const report = await analyse(bytes);
+    const tableAt =
+      bytes.length - signature.length - fake.length - garbage.length;
+    expect(report.authenticode.status).toBe("present");
+    // The unknown-type entry and the PKCS_SIGNED_DATA entry that is not DER
+    // are not signatures: their headers and bytes stay in the overlay.
+    expect(report.packing.overlay).toMatchObject({
+      offset: tableAt + signature.length,
+      bytes: fake.length + garbage.length,
+      certificate_table_bytes: signature.length,
+    });
+    expect(report.packing.overlay?.entropy).toBeGreaterThan(3);
+  });
+
+  it("keeps non-zero bytes after the SignedData inside its entry in the overlay", async () => {
+    const parked = Buffer.alloc(40, 0x5a);
+    const entry = winCertificate(Buffer.concat([FIXTURE_SIGNED_DATA, parked]));
+    const bytes = peImportFixture({ certificateTable: { table: entry } });
+    const report = await analyse(bytes);
+    const signatureBytes = 8 + FIXTURE_SIGNED_DATA.length;
+    expect(report.authenticode).toMatchObject({
+      status: "present",
+      entries: [{ signer: { status: "extracted" } }],
+    });
+    expect(report.packing.overlay).toEqual({
+      offset: bytes.length - entry.length + signatureBytes,
+      bytes: entry.length - signatureBytes,
+      entropy: expect.any(Number),
+      certificate_table_bytes: signatureBytes,
     });
   });
 });
