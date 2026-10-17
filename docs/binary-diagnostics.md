@@ -288,7 +288,9 @@ inline source. The triage facts, present in both forms, are:
   after it, reported as `certificate_table_bytes`. Other table bytes stay in
   the overlay and its entropy: entries of other types, content that is not
   SignedData and non-zero bytes after a SignedData. The overlay is null when
-  only signatures follow the sections. A malformed table excludes nothing.
+  only signatures follow the sections. In a malformed table, the signatures
+  read before the defect are still excluded; the defective entry and
+  anything after it stay in the overlay.
 - `format`: architecture, subsystem, DLL and .NET flags.
 
 The complete result adds `imports` and `delay_imports` (one entry per

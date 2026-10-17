@@ -401,7 +401,9 @@ export const readPeAuthenticode = (
       entries_omitted: omitted,
       ...NOT_VERIFIED,
     },
-    signatures: [],
+    // Each extent is bounded by its own validated dwLength, so signatures read
+    // before the defect stay excluded from the overlay; the defect does not.
+    signatures,
   });
   if (table.offset === 0 || table.size === 0)
     return malformed(

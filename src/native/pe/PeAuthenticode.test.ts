@@ -92,7 +92,7 @@ describe("PE Authenticode certificate table", () => {
     ["an offset with a zero size", { size: 0 }, "zero offset or size", 0],
     ["a size with a zero offset", { offset: 0 }, "zero offset or size", 0],
   ] as const)(
-    "reports %s as malformed, never absent, and keeps it in the overlay",
+    "reports %s as malformed, never absent, and keeps only signatures read before the defect out of the overlay",
     async (_label, override, reason, entries) => {
       const table = winCertificate(FIXTURE_SIGNED_DATA);
       const bytes = peImportFixture({
@@ -107,9 +107,11 @@ describe("PE Authenticode certificate table", () => {
       });
       if (report.authenticode.status === "malformed")
         expect(report.authenticode.entries).toHaveLength(entries);
-      expect(report.packing.overlay).toMatchObject({
-        certificate_table_bytes: 0,
-      });
+      if (entries === 0)
+        expect(report.packing.overlay).toMatchObject({
+          certificate_table_bytes: 0,
+        });
+      else expect(report.packing.overlay).toBeNull();
     },
   );
 
@@ -130,6 +132,13 @@ describe("PE Authenticode certificate table", () => {
         status: "malformed",
         reason: expect.stringContaining(reason),
         entries: [{ type_name: "PKCS_SIGNED_DATA" }],
+      });
+      // The genuine signature read first stays out of the overlay; the
+      // defective entry's bytes stay in it.
+      const signature = winCertificate(FIXTURE_SIGNED_DATA).length;
+      expect(report.packing.overlay).toMatchObject({
+        bytes: winCertificate(Buffer.alloc(8), { length }).length,
+        certificate_table_bytes: signature,
       });
     },
   );

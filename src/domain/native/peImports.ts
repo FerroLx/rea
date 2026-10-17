@@ -169,7 +169,8 @@ const certificateTable = z.strictObject({ offset: uint, size: uint });
 /**
  * Authenticode certificate table facts from IMAGE_DIRECTORY_ENTRY_SECURITY.
  * `malformed` keeps the declared table and every entry read before the defect;
- * it never means unsigned.
+ * it never means unsigned. Signatures read before the defect stay excluded from
+ * the overlay.
  */
 const authenticode = z.discriminatedUnion("status", [
   /** No security directory, or one with zero offset and size. */
