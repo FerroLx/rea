@@ -19,8 +19,8 @@ const shape = peImportsResultSchema.shape;
 const uint = z.number().int().nonnegative();
 
 /**
- * Triage facts without the import, delay-import and export tables. Artifact
- * identity and limitations are carried once by the view itself.
+ * Triage facts without the import, delay-import, export and API-string
+ * tables. Artifact identity and limitations are carried once by the view.
  */
 export const peImportsSummarySchema = peImportsResultSchema
   .omit({
@@ -28,6 +28,7 @@ export const peImportsSummarySchema = peImportsResultSchema
     imports: true,
     delay_imports: true,
     exports: true,
+    api_strings: true,
     limitations: true,
   })
   .extend({
@@ -39,7 +40,7 @@ export const peImportsSummarySchema = peImportsResultSchema
 /** Stable pages of the retained tables, one row per symbol or export entry. */
 export const peImportsViewRequestSchema = z.strictObject({
   kind: z.literal("pe-imports"),
-  collection: z.enum(["imports", "delay_imports", "exports"]),
+  collection: z.enum(["imports", "delay_imports", "exports", "api_strings"]),
   offset: z.number().int().nonnegative().default(0),
   limit: z.number().int().positive().default(64),
 });
@@ -54,6 +55,7 @@ const symbolRow = z.strictObject({
 export const peImportsViewRowsSchema = z.union([
   z.array(symbolRow),
   shape.exports.shape.entries,
+  shape.api_strings,
 ]);
 
 type Report = z.output<typeof peImportsResultSchema>;
@@ -97,7 +99,7 @@ export const projectPeImportsView = (
           path: ["view"],
           reason: "invalid_value",
           message:
-            "PE import Evidence supports summary and pe-imports views (collection imports, delay_imports or exports).",
+            "PE import Evidence supports summary and pe-imports views (collection imports, delay_imports, exports or api_strings).",
         },
       ]),
     );
@@ -122,6 +124,7 @@ export const projectPeImportsView = (
     imports: symbolTotal(report.imports),
     delay_imports: symbolTotal(report.delay_imports),
     exports: report.exports.entries.length,
+    api_strings: report.api_strings.length,
   };
   if (view.kind === "summary") {
     const {
@@ -129,10 +132,15 @@ export const projectPeImportsView = (
       imports: _imports,
       delay_imports: _delay,
       exports,
+      api_strings: _strings,
       limitations: _limitations,
       ...facts
     } = report;
-    const rows = totals.imports + totals.delay_imports + totals.exports;
+    const rows =
+      totals.imports +
+      totals.delay_imports +
+      totals.exports +
+      totals.api_strings;
     return ok({
       kind: "summary",
       view,
@@ -148,7 +156,9 @@ export const projectPeImportsView = (
   const rows =
     view.collection === "exports"
       ? report.exports.entries.slice(view.offset, view.offset + view.limit)
-      : symbolPage(report[view.collection], view.offset, view.limit);
+      : view.collection === "api_strings"
+        ? report.api_strings.slice(view.offset, view.offset + view.limit)
+        : symbolPage(report[view.collection], view.offset, view.limit);
   return ok({
     kind: "pe-imports",
     view,

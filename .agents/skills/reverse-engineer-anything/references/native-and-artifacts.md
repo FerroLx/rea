@@ -271,8 +271,11 @@ without the behaviour, `weak` ones are everyday imports, and
 `runtime_resolution` lists resolver imports and taxonomy API names present as
 strings but not imported (a weak hint); few imports plus resolvers, an entry
 point outside code, writable+executable sections or high entropy are packing
-facts, not proof. `is_dotnet` means behaviour lives in managed metadata. Pivot
-on `imphash` (pefile-identical, emulating pefile even where it reads a different table than the loader). A non-zero `import_table_disagreements` means the image's two import tables were crafted to differ: treat it as evasion evidence, and weigh `via: "address_table"` capabilities as names the loader never binds but other tools report. Omitted detail returns the complete tables inline; on large DLLs pass `detail: "summary"` to get only these triage facts, then page `imports`, `delay_imports` or `exports` with `inspect_analysis_view` view `{kind: "pe-imports", collection: "exports", offset: 0, limit: 64}` and the summary's `parent_evidence_id`. Open the image in a disassembler only for the APIs that matter. See
+facts, not proof. `authenticode` reports the certificate table and the signer
+certificate's SHA-256 and subject, never verified and with trust not assessed;
+`malformed` is not `absent`. The overlay excludes a well-formed certificate
+table. `is_dotnet` means behaviour lives in managed metadata. Pivot
+on `imphash` (pefile-identical, emulating pefile even where it reads a different table than the loader). A non-zero `import_table_disagreements` means the image's two import tables were crafted to differ: treat it as evasion evidence, and weigh `via: "address_table"` capabilities as names the loader never binds but other tools report. Omitted detail returns the complete tables inline; on large DLLs pass `detail: "summary"` to get only these triage facts, then page `imports`, `delay_imports`, `exports` or `api_strings` (every API-string hit beyond the summary's sample) with `inspect_analysis_view` view `{kind: "pe-imports", collection: "exports", offset: 0, limit: 64}` and the summary's `parent_evidence_id`. Open the image in a disassembler only for the APIs that matter. See
 [offline binary diagnostics](https://github.com/morluto/rea/blob/main/docs/binary-diagnostics.md).
 
 ## Offline PE resource inventory

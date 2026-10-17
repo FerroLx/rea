@@ -6,11 +6,15 @@
  * and a runtime-resolution sample. Every import, delay import, export and the
  * import hash are compared exactly with Python pefile (the imphash reference)
  * and the imported DLL set with llvm-readobj, through both the CLI and MCP, with
- * the advertised output schema validated. The fixtures are never executed.
+ * the advertised output schema validated. A copy of each program carries an
+ * OpenSSL-produced PKCS #7 SignedData as a WIN_CERTIFICATE; its security
+ * directory, entries and overlay are compared with pefile and its signer
+ * certificate with OpenSSL. The fixtures are never executed.
  */
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -75,6 +79,7 @@ const readobj = await firstAvailable(
   "independent import oracle",
 );
 await require(python, ["-I", "-c", "import pefile"], "pefile import oracle");
+const openssl = await require("openssl", ["version"], "SignedData producer");
 
 const run = createVerifierRun();
 const workspace = await mkdtemp(join(tmpdir(), "rea-pe-imports-verifier-"));
@@ -89,8 +94,17 @@ let cases = 0;
 const failures = [];
 
 const PEFILE_ORACLE = `
-import json, sys, pefile
+import json, struct, sys, pefile
 pe = pefile.PE(sys.argv[1])
+directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[4]
+certificates = []
+at, end = directory.VirtualAddress, directory.VirtualAddress + directory.Size
+while directory.Size and at + 8 <= end:
+    length, revision, kind = struct.unpack_from("<IHH", pe.__data__, at)
+    certificates.append([at, length, revision, kind])
+    if length < 8:
+        break
+    at += (length + 7) & ~7
 def sym(i):
     if i.import_by_ordinal:
         return "#%d=%s" % (i.ordinal, i.name.decode() if i.name else "ord%d" % i.ordinal)
@@ -101,7 +115,9 @@ exports = []
 if hasattr(pe, "DIRECTORY_ENTRY_EXPORT"):
     for s in pe.DIRECTORY_ENTRY_EXPORT.symbols:
         exports.append([s.ordinal, s.name.decode() if s.name else None, s.forwarder.decode() if s.forwarder else None])
-print(json.dumps({"imports": imports, "delay": delay, "exports": exports, "imphash": pe.get_imphash() or None}))
+print(json.dumps({"imports": imports, "delay": delay, "exports": exports, "imphash": pe.get_imphash() or None,
+    "security": [directory.VirtualAddress, directory.Size], "certificates": certificates,
+    "overlay": pe.get_overlay_data_start_offset(), "bytes": len(pe.__data__)}))
 `;
 const pefile = async (path) =>
   JSON.parse(
@@ -210,6 +226,21 @@ try {
     assert.deepEqual(summary.summary.capabilities, report.capabilities);
     assert.deepEqual(summary.summary.counts, report.counts);
     assert.deepEqual(
+      summary.summary.runtime_resolution,
+      report.runtime_resolution,
+    );
+    assert.deepEqual(summary.summary.authenticode, report.authenticode);
+    assert.equal(
+      report.api_strings.length,
+      report.runtime_resolution.api_strings.count -
+        report.runtime_resolution.api_strings.omitted,
+    );
+    assert.deepEqual(
+      await pageAll(summary.parent_evidence_id, "api_strings"),
+      report.api_strings,
+      "paged api_strings differ from the complete list",
+    );
+    assert.deepEqual(
       await pageAll(summary.parent_evidence_id, "exports"),
       report.exports.entries,
       "paged exports differ from the complete table",
@@ -270,6 +301,44 @@ try {
       byOrdinal(oracle.exports),
       `${label}: exports differ from pefile`,
     );
+    // The security directory is a file offset; pefile reads it as declared.
+    const [tableOffset, tableSize] = oracle.security;
+    if (tableOffset === 0 && tableSize === 0)
+      assert.deepEqual(report.authenticode, { status: "absent" });
+    else {
+      assert.equal(report.authenticode.status, "present", label);
+      assert.deepEqual(report.authenticode.table, {
+        offset: tableOffset,
+        size: tableSize,
+      });
+      assert.deepEqual(
+        report.authenticode.entries.map((e) => [
+          e.offset,
+          e.length,
+          e.revision,
+          e.type,
+        ]),
+        oracle.certificates,
+        `${label}: WIN_CERTIFICATE entries differ from pefile's directory`,
+      );
+      assert.equal(report.authenticode.verification, "not-performed");
+      assert.equal(report.authenticode.trust, "not-assessed");
+    }
+    // pefile's overlay starts after section data and non-security
+    // directories; REA's excludes a well-formed certificate table.
+    const certificateEnd = tableOffset + tableSize;
+    if (oracle.overlay === null) assert.equal(report.packing.overlay, null);
+    else if (
+      report.authenticode.status === "present" &&
+      oracle.overlay === tableOffset &&
+      certificateEnd === oracle.bytes
+    )
+      assert.equal(
+        report.packing.overlay,
+        null,
+        `${label}: a tail certificate table is not an overlay`,
+      );
+    else assert.equal(report.packing.overlay?.offset, oracle.overlay, label);
     const ours = [
       ...new Set(report.imports.map((g) => g.dll.toLowerCase())),
     ].sort();
@@ -325,6 +394,78 @@ int main(void) {
 }
 `,
   );
+
+  // A self-signed signer and an OpenSSL PKCS #7 SignedData over placeholder
+  // content: structure for the certificate table, not an Authenticode digest.
+  await execute(openssl, [
+    "req",
+    "-x509",
+    "-newkey",
+    "ec",
+    "-pkeyopt",
+    "ec_paramgen_curve:P-256",
+    "-nodes",
+    "-keyout",
+    at("signer.key"),
+    "-out",
+    at("signer.pem"),
+    "-subj",
+    "/O=REA Verify/CN=REA Lane Signer",
+    "-days",
+    "2",
+  ]);
+  await write("content.bin", "rea lane content");
+  await execute(openssl, [
+    "cms",
+    "-sign",
+    "-binary",
+    "-nodetach",
+    "-outform",
+    "DER",
+    "-md",
+    "sha256",
+    "-nosmimecap",
+    "-signer",
+    at("signer.pem"),
+    "-inkey",
+    at("signer.key"),
+    "-econtent_type",
+    "1.3.6.1.4.1.311.2.1.4",
+    "-in",
+    at("content.bin"),
+    "-out",
+    at("signed.der"),
+  ]);
+  const signedData = await readFile(at("signed.der"));
+  const signerDer = (
+    await execute(
+      openssl,
+      ["x509", "-in", at("signer.pem"), "-outform", "DER"],
+      {
+        encoding: "buffer",
+      },
+    )
+  ).stdout;
+  const signerSha256 = createHash("sha256").update(signerDer).digest("hex");
+  /** Append one WIN_CERTIFICATE at an 8-byte boundary and declare it. */
+  const sign = async (from, to) => {
+    const image = await readFile(from);
+    const tableAt = Math.ceil(image.length / 8) * 8;
+    const entry = Buffer.alloc(8 + Math.ceil(signedData.length / 8) * 8);
+    entry.writeUInt32LE(8 + signedData.length, 0);
+    entry.writeUInt16LE(0x200, 4);
+    entry.writeUInt16LE(2, 6);
+    signedData.copy(entry, 8);
+    const optional = image.readUInt32LE(60) + 24;
+    const security =
+      optional + (image.readUInt16LE(optional) === 0x20b ? 112 : 96) + 32;
+    image.writeUInt32LE(tableAt, security);
+    image.writeUInt32LE(entry.length, security + 4);
+    await writeFile(
+      to,
+      Buffer.concat([image, Buffer.alloc(tableAt - image.length), entry]),
+    );
+  };
 
   for (const [arch, gcc, dlltool] of [
     ["x64", gcc64, dlltool64],
@@ -421,6 +562,22 @@ int main(void) {
       `${arch}: NtLoadDriver must be reported as a runtime-resolution string`,
     );
 
+    await sign(dir("app.exe"), dir("app-signed.exe"));
+    const signed = await compare(
+      dir("app-signed.exe"),
+      `${arch} app-signed.exe`,
+    );
+    const signer = signed.authenticode.entries?.[0]?.signer;
+    assert.equal(signer?.status, "extracted", JSON.stringify(signer));
+    assert.equal(
+      signer.certificate_sha256,
+      signerSha256,
+      `${arch}: signer certificate differs from OpenSSL's DER`,
+    );
+    assert.match(signer.subject ?? "", /CN=REA Lane Signer/);
+    assert.equal(signer.content_type, "1.3.6.1.4.1.311.2.1.4");
+    assert.deepEqual(signed.capabilities, app.capabilities);
+
     const delayed = await compare(
       dir("app-delay.exe"),
       `${arch} app-delay.exe`,
@@ -469,7 +626,7 @@ console.log(
     {
       status: "passed",
       cases,
-      toolchain: "mingw-w64 + pefile + llvm-readobj",
+      toolchain: "mingw-w64 + pefile + llvm-readobj + openssl",
       entrypoint,
       verifier: await completeVerifierRun(run),
     },

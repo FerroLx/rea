@@ -18,7 +18,7 @@ import { ProviderCleanupError } from "../../domain/providerCleanupError.js";
 import { PE_IMPORTS_PROVIDER } from "../../application/InvestigationProviders.js";
 import {
   analysePeImports,
-  PE_IMPORTS_OUTPUT_BYTES,
+  PE_IMPORT_TABLES_OUTPUT_BYTES,
   PeOutputExceeded,
 } from "./PeImportAnalysis.js";
 import { PeWorkExhausted } from "./PeImportTables.js";
@@ -97,7 +97,7 @@ const primaryFailure = (
       OPERATION,
       "capacity",
       cause.message,
-      { max_output_bytes: PE_IMPORTS_OUTPUT_BYTES },
+      { max_output_bytes: PE_IMPORT_TABLES_OUTPUT_BYTES },
       { cause },
     );
   if (cause instanceof ArtifactReaderFailure) {

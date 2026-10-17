@@ -6,7 +6,12 @@ import { join, resolve } from "node:path";
 import { expect } from "vitest";
 import { toolContract } from "../../../src/contracts/toolContracts.js";
 import { peImportsResultSchema } from "../../../src/domain/native/peImports.js";
-import { peImportFixture } from "../../../src/native/pe/PeImports.fixture.js";
+import {
+  FIXTURE_SIGNED_DATA,
+  FIXTURE_SIGNER_SHA256,
+  peImportFixture,
+  winCertificate,
+} from "../../../src/native/pe/PeImports.fixture.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { parseMcpToolError } from "../../fixtures/mcpToolError.js";
 import { cliTest, type TestCli } from "../../support/cli/cliFixture.js";
@@ -25,6 +30,25 @@ const fixture = () =>
       { name: "Beta", slot: 0 },
       { name: "Gamma", slot: 1 },
     ],
+    // More API-string hits than the summary samples, one name repeated.
+    data: Buffer.from(
+      [
+        "socket",
+        "connect",
+        "WSAStartup",
+        "OpenProcessToken",
+        "VirtualAllocEx",
+        "NtLoadDriver",
+        "URLDownloadToFileW",
+        "RegSetValueExW",
+        "socket",
+        "OpenProcessToken",
+      ]
+        .map((name) => `${name}\0`)
+        .join(""),
+      "latin1",
+    ),
+    certificateTable: { table: winCertificate(FIXTURE_SIGNED_DATA) },
   });
 
 const callEvidence = async (
@@ -89,6 +113,29 @@ const expectCompleteAcrossAdapters = async (
     "Beta",
     "Gamma",
   ]);
+  expect(report.api_strings).toHaveLength(10);
+  expect(report.runtime_resolution.api_strings).toMatchObject({
+    count: 10,
+    omitted: 0,
+  });
+  expect(report.authenticode).toMatchObject({
+    status: "present",
+    table: { size: winCertificate(FIXTURE_SIGNED_DATA).length },
+    entries: [
+      {
+        length: 8 + FIXTURE_SIGNED_DATA.length,
+        type_name: "PKCS_SIGNED_DATA",
+        signer: {
+          status: "extracted",
+          certificate_sha256: FIXTURE_SIGNER_SHA256,
+        },
+      },
+    ],
+    verification: "not-performed",
+    trust: "not-assessed",
+  });
+  // The certificate table is the file's tail, not an unexplained overlay.
+  expect(report.packing.overlay).toBeNull();
   expect(evidence.parameters).toEqual({ path });
   for (const arguments_ of [{ path }, { path, detail: "complete" }]) {
     const mcp = await callEvidence(client, arguments_);
@@ -118,6 +165,7 @@ const expectSummaryAndPages = async (
     imports: _imports,
     delay_imports: _delay,
     exports,
+    api_strings: _strings,
     limitations,
     ...facts
   } = report;
@@ -165,6 +213,24 @@ const expectSummaryAndPages = async (
     rows: report.exports.entries.slice(0, 2),
     coverage: { total: 3, next_offset: 2, exhausted: false },
   });
+  // Every API-string hit pages back, beyond the summary's sample.
+  const strings = [];
+  for (let offset: number | null = 0; offset !== null;) {
+    const page = await view(client, parent, {
+      kind: "pe-imports",
+      collection: "api_strings",
+      offset,
+      limit: 4,
+    });
+    if (page.kind !== "pe-imports")
+      throw new Error("expected a pe-imports page");
+    strings.push(...page.rows);
+    offset = page.coverage.next_offset;
+  }
+  expect(strings).toEqual(report.api_strings);
+  expect(projected.summary.runtime_resolution.api_strings.sample.length).toBe(
+    8,
+  );
   const delay = await view(client, parent, {
     kind: "pe-imports",
     collection: "delay_imports",

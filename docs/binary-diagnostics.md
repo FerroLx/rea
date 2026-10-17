@@ -257,15 +257,37 @@ inline source. The triage facts, present in both forms, are:
 - `dlls`: imported DLLs in first-appearance order; API-set names are tagged.
 - `runtime_resolution`: imported resolvers (`GetProcAddress`, `LoadLibrary*`,
   `Ldr*`) and taxonomy API names that appear as ASCII or UTF-16 strings but are
-  not imported, a weak hint of runtime resolution.
+  not imported, a weak hint of runtime resolution. `api_strings` gives the hit
+  `count`, a `sample` of up to eight distinct APIs and `omitted`, the hits past
+  the listed ceiling; every listed hit is in the complete result's
+  `api_strings` list.
+- `authenticode`: the certificate table from the security data directory,
+  whose address is a file offset rather than an RVA. `absent` means no table
+  is declared; `present` gives the table's offset and size, the bytes after
+  it, and each `WIN_CERTIFICATE` (offset, length, revision, type such as
+  `PKCS_SIGNED_DATA`). For a `PKCS_SIGNED_DATA` entry, the signer certificate
+  located by the first SignerInfo's issuer and serial number is reported with
+  its DER SHA-256, subject, issuer and serial number. A table or entry that
+  leaves the file, or a declared zero offset or size, is `malformed` with the
+  reason and the entries read before it, never `absent`. Nothing is verified:
+  `verification` is always `not-performed` and `trust` `not-assessed`, so a
+  present signature is not evidence of a valid or trusted publisher. Nested
+  signatures and timestamps inside unsigned attributes are not examined.
 - `packing`: entry-point section, writable+executable sections, zero-raw large
-  virtual sections, the highest section entropy and the overlay.
+  virtual sections, the highest section entropy and the overlay. The overlay
+  excludes a `present` certificate table (normally the file's tail) and
+  reports its size as `certificate_table_bytes`; it is null when only the
+  table follows the sections. A malformed table excludes nothing.
 - `format`: architecture, subsystem, DLL and .NET flags.
 
 The complete result adds `imports` and `delay_imports` (one entry per
 descriptor, with ordinal imports resolved through pefile's ordinal tables,
-`ord<N>` otherwise) and `exports` (with forwarders). After a summary, page them
-with `inspect_analysis_view`:
+`ord<N>` otherwise), `exports` (with forwarders) and `api_strings` (every listed
+API-string hit with its file offset and encoding, in scan order). At most 8,192
+hits are listed: each serializes to at most 128 bytes, so the list is reserved
+1 MiB of the 8 MiB complete-result ceiling, leaving 7 MiB for the tables. Hits
+past it are counted in `omitted` and stated in `limitations`. After a summary,
+page these collections with `inspect_analysis_view`:
 
 ```json
 {
@@ -295,7 +317,7 @@ and are not found.
 
 The image is read once as a stable regular-file snapshot of at most 64 MiB.
 Table walks are bounded by a work budget proportional to the file size;
-exhausting it, or tables that would serialise above 8 MiB, fails without
+exhausting it, or tables that would serialise above 7 MiB, fails without
 partial output.
 Malformed tables are reported in `counts` (unreadable entries, unmapped
 delay-load addresses) instead of being guessed. As in pefile, an unusable
@@ -313,3 +335,7 @@ supported.
 `npm run verify:pe-imports` builds x86 and x64 mingw-w64 fixtures and
 compares every import, delay import, export, ordinal resolution and the import
 hash with pefile, and the DLL set with llvm-readobj, through both CLI and MCP.
+It pages every collection, including `api_strings`, back to the complete
+result. A copy of each program carries an OpenSSL-produced PKCS #7 SignedData
+as a `WIN_CERTIFICATE`; its security directory, entries and overlay are
+compared with pefile, and its signer certificate SHA-256 with OpenSSL.

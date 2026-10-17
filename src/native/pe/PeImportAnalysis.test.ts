@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import { analysePeImports } from "./PeImportAnalysis.js";
 import { peImportFixture } from "./PeImports.fixture.js";
+import { PE_API_STRING_HITS_MAX } from "../../domain/native/peImports.js";
 
 const analyse = (bytes: Buffer) =>
   analysePeImports(
@@ -292,5 +293,52 @@ describe("PE image layouts and table shapes", () => {
       exports_named: 3,
       forwarders: 2,
     });
+  });
+});
+
+describe("PE API-string hits", () => {
+  it("lists every API-string hit in the complete result and samples distinct APIs for the summary", async () => {
+    const names = [
+      "socket",
+      "connect",
+      "WSAStartup",
+      "OpenProcessToken",
+      "VirtualAllocEx",
+      "WriteProcessMemory",
+      "CreateRemoteThread",
+      "NtLoadDriver",
+      "URLDownloadToFileW",
+      "socket",
+      "socket",
+    ];
+    const report = await analyse(
+      peImportFixture({
+        data: Buffer.from(names.map((name) => `${name}\0`).join(""), "latin1"),
+      }),
+    );
+    expect(report.api_strings.map(({ api }) => api)).toEqual(names);
+    expect(report.runtime_resolution.api_strings).toMatchObject({
+      count: names.length,
+      omitted: 0,
+    });
+    const sample = report.runtime_resolution.api_strings.sample;
+    expect(sample).toHaveLength(8);
+    expect(new Set(sample.map(({ api }) => api)).size).toBe(8);
+    expect(sample).toEqual(report.api_strings.slice(0, 8));
+  });
+
+  it("counts API-string hits past the listed ceiling and states the omission", async () => {
+    const hits = PE_API_STRING_HITS_MAX + 5;
+    const report = await analyse(
+      peImportFixture({ data: Buffer.from("socket\0".repeat(hits), "latin1") }),
+    );
+    expect(report.runtime_resolution.api_strings).toMatchObject({
+      count: hits,
+      omitted: 5,
+    });
+    expect(report.api_strings).toHaveLength(PE_API_STRING_HITS_MAX);
+    expect(report.limitations).toContainEqual(
+      expect.stringContaining("5 API-string hits past the first 8192"),
+    );
   });
 });

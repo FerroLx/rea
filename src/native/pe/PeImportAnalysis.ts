@@ -1,6 +1,8 @@
 import { setImmediate } from "node:timers/promises";
 
 import {
+  PE_API_STRING_HITS_MAX,
+  PE_AUTHENTICODE_LIMITATION,
   PE_IMPORTS_LIMITATIONS,
   type PeImportsResult,
 } from "../../domain/native/peImports.js";
@@ -25,12 +27,13 @@ import {
   walkImports,
 } from "./PeImportTables.js";
 import { pefileImphash } from "./PefileImphash.js";
+import { readPeAuthenticode } from "./PeAuthenticode.js";
 
 /** Matched APIs listed per capability (the total is always reported). */
 const CAPABILITY_SAMPLE = 8;
 /** DLLs listed in the summary (all are counted). */
 const DLL_SAMPLE = 64;
-/** Runtime-resolution string hits listed (all are counted). */
+/** Distinct-API string hits in the summary sample (all listed hits page). */
 const STRING_SAMPLE = 8;
 /** Identifier lengths considered by the string scan (shortest taxonomy name is "send"). */
 const MIN_API_STRING = 6;
@@ -39,7 +42,16 @@ const MAX_API_STRING = 64;
  * Complete-result ceiling: the tables are always retained as Evidence (summary
  * delivery pages them), so a result past it is refused, never truncated.
  */
-export const PE_IMPORTS_OUTPUT_BYTES = 8 * 1024 * 1024;
+const PE_IMPORTS_OUTPUT_BYTES = 8 * 1024 * 1024;
+/**
+ * Serialized bytes reserved for the API-string list: PE_API_STRING_HITS_MAX
+ * hits of at most 128 bytes each. Hits are a weak hint, so past the ceiling
+ * they are counted rather than refusing the tables.
+ */
+const API_STRINGS_OUTPUT_BYTES = PE_API_STRING_HITS_MAX * 128;
+/** What the import, delay-import and export tables may project to. */
+export const PE_IMPORT_TABLES_OUTPUT_BYTES =
+  PE_IMPORTS_OUTPUT_BYTES - API_STRINGS_OUTPUT_BYTES;
 /** Projected serialized bytes per table symbol, before its strings (JSON-escaped at most 2x). */
 const TABLE_SYMBOL_BYTES = 96;
 
@@ -47,7 +59,7 @@ const TABLE_SYMBOL_BYTES = 96;
 export class PeOutputExceeded extends Error {
   constructor(readonly projectedBytes: number) {
     super(
-      `The import/export tables would serialise to more than ${String(PE_IMPORTS_OUTPUT_BYTES)} bytes.`,
+      `The import/export tables would serialise to more than ${String(PE_IMPORT_TABLES_OUTPUT_BYTES)} bytes.`,
     );
     this.name = "PeOutputExceeded";
   }
@@ -89,32 +101,79 @@ const charge = (work: PeWork, units: number): void => {
 };
 
 /**
- * Shannon entropy (bits per byte) of a byte range. One linear pass over bytes
- * that exist, so it is bounded by the file size and not charged to the
- * table-walk budget (which guards amplification, not size).
+ * Shannon entropy (bits per byte) of byte ranges taken together. One linear
+ * pass over bytes that exist, so it is bounded by the file size and not charged
+ * to the table-walk budget (which guards amplification, not size).
  */
 const entropy = async (
-  bytes: Uint8Array,
+  ranges: readonly Uint8Array[],
   signal: AbortSignal | undefined,
 ): Promise<number> => {
-  if (bytes.length === 0) return 0;
   const counts = new Uint32Array(256);
-  // Counted per MiB, polling for cancellation between slices.
-  for (let from = 0; from < bytes.length; from += SCAN_YIELD_BYTES) {
-    const to = Math.min(bytes.length, from + SCAN_YIELD_BYTES);
-    for (let at = from; at < to; at++) counts[bytes[at]!]! += 1;
-    if (to < bytes.length) {
-      await setImmediate();
-      signal?.throwIfAborted();
+  let length = 0;
+  for (const bytes of ranges) {
+    length += bytes.length;
+    // Counted per MiB, polling for cancellation between slices.
+    for (let from = 0; from < bytes.length; from += SCAN_YIELD_BYTES) {
+      const to = Math.min(bytes.length, from + SCAN_YIELD_BYTES);
+      for (let at = from; at < to; at++) counts[bytes[at]!]! += 1;
+      if (to < bytes.length) {
+        await setImmediate();
+        signal?.throwIfAborted();
+      }
     }
   }
+  if (length === 0) return 0;
   let total = 0;
   for (const count of counts) {
     if (count === 0) continue;
-    const p = count / bytes.length;
+    const p = count / length;
     total -= p * Math.log2(p);
   }
   return Math.round(total * 1000) / 1000;
+};
+
+/**
+ * The overlay (file bytes after the last section's raw data) without a
+ * well-formed certificate table, which is normally the file's tail. A
+ * malformed table excludes nothing: its declared extent is not trusted.
+ */
+const overlayFacts = async (
+  bytes: Buffer,
+  overlay: { readonly offset: number; readonly size: number },
+  authenticode: PeImportsResult["authenticode"],
+  signal: AbortSignal | undefined,
+): Promise<PeImportsResult["packing"]["overlay"]> => {
+  const start = overlay.offset;
+  const end = overlay.offset + overlay.size;
+  let ranges: [number, number][] = [[start, end]];
+  let certificateBytes = 0;
+  if (authenticode.status === "present") {
+    const from = Math.max(start, authenticode.table.offset);
+    const to = Math.min(
+      end,
+      authenticode.table.offset + authenticode.table.size,
+    );
+    if (from < to) {
+      certificateBytes = to - from;
+      ranges = [
+        [start, from],
+        [to, end],
+      ];
+    }
+  }
+  ranges = ranges.filter(([from, to]) => to > from);
+  const first = ranges[0];
+  if (first === undefined) return null;
+  return {
+    offset: first[0],
+    bytes: ranges.reduce((total, [from, to]) => total + to - from, 0),
+    entropy: await entropy(
+      ranges.map(([from, to]) => bytes.subarray(from, to)),
+      signal,
+    ),
+    certificate_table_bytes: certificateBytes,
+  };
 };
 
 /** IMAGE_LOAD_CONFIG_DIRECTORY CHPEMetadataPointer offset (PE32, PE32+). */
@@ -160,10 +219,13 @@ const scanApiStrings = async (
   layout: PeImageLayout,
   excluded: ReadonlySet<string>,
   work: PeWork,
-): Promise<PeImportsResult["runtime_resolution"]["api_strings"]> => {
+): Promise<{
+  readonly summary: PeImportsResult["runtime_resolution"]["api_strings"];
+  readonly hits: PeImportsResult["api_strings"];
+}> => {
   let count = 0;
-  const sample: PeImportsResult["runtime_resolution"]["api_strings"]["sample"] =
-    [];
+  const hits: PeImportsResult["api_strings"] = [];
+  const sample: PeImportsResult["api_strings"] = [];
   const seen = new Set<string>();
   /** Report a taxonomy name; false when `api` is not one. */
   const report = (
@@ -174,10 +236,12 @@ const scanApiStrings = async (
     if (importTaxonomyEntry(api) === undefined) return false;
     if (excluded.has(api)) return true;
     count += 1;
+    const hit = { api, offset, encoding };
+    if (hits.length < PE_API_STRING_HITS_MAX) hits.push(hit);
     // Sample distinct APIs, so one repeated name cannot fill it.
     if (sample.length < STRING_SAMPLE && !seen.has(api)) {
       seen.add(api);
-      sample.push({ api, offset, encoding });
+      sample.push(hit);
     }
     return true;
   };
@@ -251,7 +315,10 @@ const scanApiStrings = async (
       work.signal?.throwIfAborted();
     }
   }
-  return { count, sample };
+  return {
+    summary: { count, sample, omitted: count - hits.length },
+    hits,
+  };
 };
 
 /**
@@ -360,7 +427,7 @@ export const analysePeImports = async (
         current = entry;
       }
       tableBytes += TABLE_SYMBOL_BYTES + 2 * dll.length;
-      if (tableBytes > PE_IMPORTS_OUTPUT_BYTES)
+      if (tableBytes > PE_IMPORT_TABLES_OUTPUT_BYTES)
         throw new PeOutputExceeded(tableBytes);
       tables[table].push({ dll, symbols: [] });
     };
@@ -389,7 +456,7 @@ export const analysePeImports = async (
       const name = symbolName(symbol);
       if (name !== null) recordCapability(name, dll, table);
       tableBytes += TABLE_SYMBOL_BYTES + 2 * (name?.length ?? 0);
-      if (tableBytes > PE_IMPORTS_OUTPUT_BYTES)
+      if (tableBytes > PE_IMPORT_TABLES_OUTPUT_BYTES)
         throw new PeOutputExceeded(tableBytes);
       tables[table].at(-1)!.symbols.push(
         symbol.kind === "name"
@@ -436,7 +503,7 @@ export const analysePeImports = async (
       TABLE_SYMBOL_BYTES +
       2 * (visit.name?.length ?? 0) +
       (visit.kind === "forwarder" ? 2 * (visit.target?.length ?? 0) : 0);
-    if (tableBytes > PE_IMPORTS_OUTPUT_BYTES)
+    if (tableBytes > PE_IMPORT_TABLES_OUTPUT_BYTES)
       throw new PeOutputExceeded(tableBytes);
     exportEntries.push(visit);
   });
@@ -460,7 +527,7 @@ export const analysePeImports = async (
   for (const section of layout.sections) {
     if (section.size === 0) continue;
     const value = await entropy(
-      bytes.subarray(section.offset, section.offset + section.size),
+      [bytes.subarray(section.offset, section.offset + section.size)],
       options.signal,
     );
     if (maxEntropy === null || value > maxEntropy.entropy)
@@ -472,20 +539,13 @@ export const analysePeImports = async (
   // intelligence pivots on it even where it differs from what the loader binds.
   const imphash = await pefileImphash(bytes, layout, work);
   const importCount = counts.imports + counts.delay_imports;
-  const overlay =
-    layout.overlay.size === 0
-      ? null
-      : {
-          offset: layout.overlay.offset,
-          bytes: layout.overlay.size,
-          entropy: await entropy(
-            bytes.subarray(
-              layout.overlay.offset,
-              layout.overlay.offset + layout.overlay.size,
-            ),
-            options.signal,
-          ),
-        };
+  const authenticode = readPeAuthenticode(bytes, layout);
+  const overlay = await overlayFacts(
+    bytes,
+    layout.overlay,
+    authenticode,
+    options.signal,
+  );
 
   const machine = decodePeMachine(layout.machine);
   const dotnet = layout.dataDirectory(14);
@@ -541,8 +601,9 @@ export const analysePeImports = async (
     dlls_truncated: orderedDlls.length > DLL_SAMPLE,
     runtime_resolution: {
       resolver_imports: [...resolverImports].sort(),
-      api_strings: apiStrings,
+      api_strings: apiStrings.summary,
     },
+    authenticode,
     packing: {
       import_count: importCount,
       few_imports_with_resolvers:
@@ -568,6 +629,7 @@ export const analysePeImports = async (
     },
     imports: tables.import,
     delay_imports: tables.delay,
+    api_strings: apiStrings.hits,
     exports: {
       dll_name: exportFacts.dllName,
       entries: exportEntries.map((entry) =>
@@ -590,6 +652,12 @@ export const analysePeImports = async (
     limitations: [
       ...PE_IMPORTS_LIMITATIONS,
       ...walkLimitations,
+      ...(authenticode.status === "absent" ? [] : [PE_AUTHENTICODE_LIMITATION]),
+      ...(apiStrings.summary.omitted > 0
+        ? [
+            `${String(apiStrings.summary.omitted)} API-string hits past the first ${String(PE_API_STRING_HITS_MAX)} are counted but not listed in api_strings.`,
+          ]
+        : []),
       ...(declaresHybridMetadata(bytes, layout) ? [HYBRID_LIMITATION] : []),
     ],
   };

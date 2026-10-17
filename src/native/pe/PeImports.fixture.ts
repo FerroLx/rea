@@ -36,7 +36,76 @@ interface ImportFixture {
   readonly machine?: number;
   /** Declare a CLI (.NET) header directory entry (its contents are not read). */
   readonly cliHeader?: boolean;
+  /**
+   * A certificate table appended after the section data (8-byte aligned), with
+   * optional bytes after it; `offset`/`size` override the declared security
+   * directory (a file offset and size).
+   */
+  readonly certificateTable?: {
+    readonly table: Buffer;
+    readonly trailing?: Buffer;
+    readonly offset?: number;
+    readonly size?: number;
+  };
 }
+
+/**
+ * A PKCS #7 SignedData produced by OpenSSL 3 (`openssl cms -sign -binary
+ * -nodetach -md sha256 -nosmimecap -econtent_type 1.3.6.1.4.1.311.2.1.4`) with
+ * an EC P-256 leaf "O=REA Tests, CN=REA Fixture Signer" (serial 0x00C0FFEE01)
+ * issued by an embedded "CN=REA Fixture Root". Its content is not an image
+ * digest: it exercises structure, never verification.
+ */
+export const FIXTURE_SIGNED_DATA = Buffer.from(
+  "MIIEtgYJKoZIhvcNAQcCoIIEpzCCBKMCAQMxDTALBglghkgBZQMEAgEwIwYKKwYBBAGCNwIB" +
+    "BKAVBBNyZWEgZml4dHVyZSBjb250ZW50oIIDVTCCAZgwggE9oAMCAQICBQDA/+4BMAoGCCqG" +
+    "SM49BAMCMC8xEjAQBgNVBAoMCVJFQSBUZXN0czEZMBcGA1UEAwwQUkVBIEZpeHR1cmUgUm9v" +
+    "dDAgFw0yNjEwMTcxMjE4MDRaGA8yMTI2MDkyMzEyMTgwNFowMTESMBAGA1UECgwJUkVBIFRl" +
+    "c3RzMRswGQYDVQQDDBJSRUEgRml4dHVyZSBTaWduZXIwWTATBgcqhkjOPQIBBggqhkjOPQMB" +
+    "BwNCAAQa3JtpPYTz5A3DqdkfVeB9HIsHTnLTNRGDNJLzOWIm4auWCspJqYRnm+cGfa+eJbPt" +
+    "jxCk0ifhklB6ErRE1ZXNo0IwQDAdBgNVHQ4EFgQU4Z8f+J+ktVN25PvPkCjeOlHldh0wHwYD" +
+    "VR0jBBgwFoAU7PwigFvBwHFS5zf4WxZg7ZYIw/kwCgYIKoZIzj0EAwIDSQAwRgIhAKnaRjVt" +
+    "E5s2oKfxLdwo0uvXcYotP0P2DkjxrylOWeFyAiEA0hjgdrs8oNccAMp5akDfGqVRg7xqEupt" +
+    "50TxZuhjJucwggG1MIIBW6ADAgECAhRlGGmTzx2VVvJtu3sYk8XIw8XX8TAKBggqhkjOPQQD" +
+    "AjAvMRIwEAYDVQQKDAlSRUEgVGVzdHMxGTAXBgNVBAMMEFJFQSBGaXh0dXJlIFJvb3QwIBcN" +
+    "MjYxMDE3MTIxODA0WhgPMjEyNjA5MjMxMjE4MDRaMC8xEjAQBgNVBAoMCVJFQSBUZXN0czEZ" +
+    "MBcGA1UEAwwQUkVBIEZpeHR1cmUgUm9vdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABKH1" +
+    "oNkgKxa4bwYQdp6Rs77o/MIDaH1zty4TlSlQ0lzIh7So4O93rwmbM7pze+ajBicBGKcUmalA" +
+    "Ai2pSSUVJc6jUzBRMB0GA1UdDgQWBBTs/CKAW8HAcVLnN/hbFmDtlgjD+TAfBgNVHSMEGDAW" +
+    "gBTs/CKAW8HAcVLnN/hbFmDtlgjD+TAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gA" +
+    "MEUCIBftgqFFrDdohP8MfnDGd6Nw3qtbJNv6c81Om6lLQjTbAiEAwjGClYiEdNkW89PnLeW/" +
+    "xqpSoLSTLoFFYKafwmJClHkxggEPMIIBCwIBATA4MC8xEjAQBgNVBAoMCVJFQSBUZXN0czEZ" +
+    "MBcGA1UEAwwQUkVBIEZpeHR1cmUgUm9vdAIFAMD/7gEwCwYJYIZIAWUDBAIBoGowGQYJKoZI" +
+    "hvcNAQkDMQwGCisGAQQBgjcCAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTAxNzEyMTgwNFowLwYJ" +
+    "KoZIhvcNAQkEMSIEIDP2xWOOe8spvjPgfZM8QmiGZIbOXPXFCauCfX7tRAj9MAoGCCqGSM49" +
+    "BAMCBEcwRQIhAMynWbOisGCWujKnbzgP7ee7mtDfka7NblAZUIsqzPYlAiBCYF5TBjYhhjCz" +
+    "KQztFMCEuzPB1rYaHcl5j9hUSp7amQ==",
+  "base64",
+);
+/** SHA-256 of the fixture leaf certificate's DER (from `openssl x509 -outform DER`). */
+export const FIXTURE_SIGNER_SHA256 =
+  "0f3e2b9f4b1f676dfbea49c1689820c3a05840f92fc7765805ce205cbba147e5";
+
+/** One WIN_CERTIFICATE (dwLength, wRevision, wCertificateType), padded to 8 bytes. */
+export const winCertificate = (
+  payload: Buffer,
+  {
+    type = 2,
+    revision = 0x200,
+    length,
+  }: {
+    readonly type?: number;
+    readonly revision?: number;
+    readonly length?: number;
+  } = {},
+): Buffer => {
+  const header = Buffer.alloc(8);
+  header.writeUInt32LE(length ?? 8 + payload.length, 0);
+  header.writeUInt16LE(revision, 4);
+  header.writeUInt16LE(type, 6);
+  const entry = Buffer.concat([header, payload]);
+  return Buffer.concat([entry, Buffer.alloc((8 - (entry.length % 8)) % 8)]);
+};
 
 /**
  * A hand-authored PE32 image with one `.idata` section at RVA 0x2000 holding
@@ -56,6 +125,7 @@ export const peImportFixture = ({
   chpeMetadata = false,
   machine = 0x14c,
   cliHeader = false,
+  certificateTable,
 }: ImportFixture) => {
   const SECTION_RVA = 0x2000;
   const RAW = 0x400;
@@ -187,5 +257,30 @@ export const peImportFixture = ({
   bytes.writeUInt32LE(rawPointer ?? RAW, section + 20);
   bytes.writeUInt32LE(0xc0000040, section + 36); // initialised data, R/W
   content.copy(bytes, contentOffset);
-  return bytes;
+  return certificateTable === undefined
+    ? bytes
+    : withCertificateTable(bytes, directories, certificateTable);
+};
+
+/** Append a certificate table at an 8-byte boundary and declare it. */
+const withCertificateTable = (
+  bytes: Buffer,
+  directories: number,
+  {
+    table,
+    trailing,
+    offset,
+    size,
+  }: NonNullable<ImportFixture["certificateTable"]>,
+): Buffer => {
+  const tableAt = Math.ceil(bytes.length / 8) * 8;
+  // IMAGE_DIRECTORY_ENTRY_SECURITY: a file offset, not an RVA.
+  bytes.writeUInt32LE(offset ?? tableAt, directories + 32);
+  bytes.writeUInt32LE(size ?? table.length, directories + 36);
+  return Buffer.concat([
+    bytes,
+    Buffer.alloc(tableAt - bytes.length),
+    table,
+    trailing ?? Buffer.alloc(0),
+  ]);
 };
