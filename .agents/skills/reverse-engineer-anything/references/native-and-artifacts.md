@@ -290,16 +290,14 @@ compiler-emitted `SourceFile`, `LineNumberTable`, `LocalVariableTable` and
 `LocalVariableTypeTable` and classifies each method's debugging readiness
 (`present | partial | stripped | malformed | not-applicable`), binding bytecode
 offsets, local slots and scope ranges to the method's name and descriptor. Each
-local scope reports where it lies in the code; from class version 51 one
-starting or ending inside an instruction is `misaligned` and its table
-`malformed`, as HotSpot rejects it (a type-table row only when the method has
-local-variable rows). A JAR is read as `JarFile` reads it: one with a
-central-directory record `ZipFile` refuses (encrypted, an unsupported
-compression method, an oversized header or a malformed extra field) is
-refused, only the manifest and the selected class count against the
-decompression budget, and a `META-INF/` entry is never versioned. REA refuses,
-rather than answers, a member whose local header disagrees with its directory
-record or whose CRC-32 is wrong. No
+local scope reports where it lies in the code; from class version 51 a
+`LocalVariableTable` scope starting or ending inside an instruction is
+`misaligned` and its table `malformed`, as HotSpot rejects it, and type-table
+rows must match `LocalVariableTable` rows as HotSpot matches them. A JAR is
+opened and read as OpenJDK 25's `ZipFile`/`JarFile` open and read it: REA
+refuses it exactly where the JDK refuses to open it, quoting the JDK's
+exception, reads members from the central directory alone (no CRC or
+local-header comparison), and never versions a `META-INF/` entry. No
 Java executes; `SourceDebugExtension` is reported by presence and length only; decompiler line numbers are
 never substituted for compiler positions.
 

@@ -1,14 +1,10 @@
 import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
 import type { JvmDebugMetadataExecution } from "../application/jvm/JvmDebugMetadataPort.js";
-import {
-  AnalysisCleanupLease,
-  AnalysisCleanupLeaseGroup,
-} from "../artifacts/AnalysisCleanupLease.js";
+import { AnalysisCleanupLeaseGroup } from "../artifacts/AnalysisCleanupLease.js";
 import {
   ArtifactFileCancelled,
   ArtifactFileCleanupFailure,
 } from "../artifacts/ArtifactFileOperation.js";
-import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
 import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
 import {
@@ -29,14 +25,13 @@ export interface JarRequest {
   readonly signal: AbortSignal | undefined;
 }
 
-/** A finished JAR read and, when it failed to close, the retained ZIP reader. */
+/**
+ * A finished JAR read. The archive is read through the admitted descriptor
+ * alone, so its close is the only cleanup the inspection waits on.
+ */
 export class JarInspection {
   constructor(
     readonly result: Result<JvmDebugMetadataExecution, AnalysisError>,
-    readonly readerCleanup?: {
-      readonly cause: unknown;
-      readonly lease: AnalysisCleanupLease;
-    },
   ) {}
 }
 
@@ -57,10 +52,9 @@ export const completedJarInspection = (
 /**
  * Classify a completed JAR inspection after its final close. A primary failure
  * keeps precedence over late cancellation; a completed result is retained as
- * the error's observation under cancellation or unconfirmed cleanup. Cleanup
- * failures of the archive descriptor and the ZIP reader are reported once and
- * bound to their exact leases, so the error resolves after close() releases
- * them. An unknown descriptor owner leaves the error unresolved.
+ * the error's observation under cancellation or unconfirmed cleanup. A
+ * descriptor cleanup failure is bound to its exact leases, so the error
+ * resolves after close() releases them; an unknown owner leaves it unresolved.
  */
 export const finishJarInspection = (
   { input, signal }: JarRequest,
@@ -71,10 +65,9 @@ export const finishJarInspection = (
     closeOutcome instanceof ArtifactFileCleanupFailure
       ? closeOutcome
       : undefined;
-  const readerCleanup = inspection.readerCleanup;
   const cancelled = signal?.aborted === true;
   const { result } = inspection;
-  if (fileCleanup === undefined && readerCleanup === undefined) {
+  if (fileCleanup === undefined) {
     if (!result.ok || !cancelled) return result;
     return err(
       new AnalysisCancelledError(OPERATION, {
@@ -86,29 +79,11 @@ export const finishJarInspection = (
       }),
     );
   }
-  const observations = [
-    ...(fileCleanup?.cleanup === undefined ? [] : [fileCleanup.cleanup]),
-    ...(readerCleanup === undefined
-      ? []
-      : [
-          ArtifactReaderFailure.cleanupObservation(
-            readerCleanup.cause,
-            input.path,
-          ),
-        ]),
-  ];
   const cleanupFacts = {
-    reason: observations.map(({ reason }) => reason).join("; "),
-    resources: [...new Set(observations.flatMap(({ resources }) => resources))],
+    reason: fileCleanup.cleanup?.reason ?? "",
+    resources: [...new Set(fileCleanup.cleanup?.resources ?? [])],
   };
-  const causes = [
-    ...(fileCleanup === undefined ? [] : [fileCleanup]),
-    ...(readerCleanup === undefined ? [] : [readerCleanup.cause]),
-  ];
-  const cleanupCause =
-    causes.length === 1
-      ? causes[0]
-      : new AggregateError(causes, "JAR descriptor and reader cleanup failed");
+  const cleanupCause = fileCleanup;
   const evidence = result.ok
     ? createJavaDebugMetadataEvidence(input, result.value)
     : undefined;
@@ -128,11 +103,7 @@ export const finishJarInspection = (
         jvmCleanupError(cleanupFacts, cleanupCause),
         OPERATION,
       );
-  const fileLeases = fileCleanup === undefined ? [] : fileCleanup.cleanupLeases;
-  if (fileLeases !== undefined)
-    new AnalysisCleanupLeaseGroup(error, [
-      ...fileLeases,
-      ...(readerCleanup === undefined ? [] : [readerCleanup.lease]),
-    ]);
+  if (fileCleanup.cleanupLeases !== undefined)
+    new AnalysisCleanupLeaseGroup(error, [...fileCleanup.cleanupLeases]);
   return err(error);
 };

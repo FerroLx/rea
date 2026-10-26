@@ -47,29 +47,55 @@ itself. Members are matched by their stored ZIP names, as the JDK's
 or a leading `/` or `./`, but a member stored with a leading `./` is an inert
 resource that never supplies the entry, an override, or an ambiguity. Stored
 names are decoded as the JDK's `JarFile` decodes them: as UTF-8 whether or not
-the ZIP language-encoding flag is set. A JAR holding a member name or entry
-comment that is not valid UTF-8 is refused as invalid input, because the JDK
-refuses to open it ("invalid CEN header (bad entry name or comment)"). So is,
-whichever member is requested, a JAR holding any other central-directory
-record OpenJDK 25's `ZipFile` refuses to index, and REA names the JDK's
-message: a record flagged as encrypted ("encrypted entry"), one whose
-compression method is neither stored (0) nor deflated (8) ("bad compression
-method"), one whose header (46 bytes plus name, extra field and comment)
-exceeds 65,535 bytes ("bad header size"), an extra field whose declared size
-runs past the record's extra data, a zip64 extra field whose size is not
-exactly what the record's `0xFFFFFFFF`/`0xFFFF` markers call for, or such a
-marker on a record with no extra data. A central directory that does not end
-exactly at its last record (a record running past it, trailing bytes, or a
-digital-signature record) is refused too ("bad header size"). OpenJDK 21 does
-not make the header-size and zip64 extra-field checks.
+the ZIP language-encoding flag is set.
 
-REA is stricter than `JarFile` in a few cases, where it refuses the JAR as
-invalid input rather than answering: a member REA reads (the manifest or the
-selected class) whose local header disagrees with its central-directory record
-(an encryption flag, sizes or compression method set in only one of them) or
-whose CRC-32 does not match its bytes, and any record whose zip64 size or
-offset exceeds 2^53 − 1. OpenJDK 21 and 25 open these archives and read the
-members.
+REA opens a JAR as OpenJDK 25's `java.util.zip.ZipFile` opens it, with its own
+reader of the archive's END, zip64 END and central-directory records (no other
+ZIP library is consulted), and refuses it as invalid input exactly where the
+JDK refuses to open it, quoting the JDK's exception and message:
+
+- `findEND`: an empty file ("zip file is empty"); no END record in the last
+  65,557 bytes whose comment reaches the end of the file, or whose directory
+  and first local header start with their signatures ("zip END header not
+  found"); an END comment that runs past the end of the file
+  (`java.io.EOFException`). A zip64 END record named by a locator just before
+  END is used when its values agree with END's, whether or not END holds
+  `0xFFFF`/`0xFFFFFFFF` markers. END's disk numbers are ignored.
+- `initCEN`: a directory size larger than END's position ("invalid END header
+  (bad central directory size)"), a directory offset before the start of the
+  file ("bad central directory offset"), a directory over 2,147,483,639 bytes
+  ("central directory size too large"), or an entry count over the directory
+  size / 46 ("total entries count too large"). A smaller entry count than the
+  records present is recounted, as the JDK recounts it. A directory that does
+  not end exactly at its last record, including one holding a
+  digital-signature record, is refused ("invalid CEN header (bad header
+  size)").
+- `checkAndAddEntry`, in the JDK's order for each record: a bad signature, the
+  encryption flag, a compression method other than stored (0) or deflated (8),
+  a header (46 bytes plus name, extra field and comment) over 65,535 bytes or
+  past the directory, an extra field whose declared size runs past the
+  record's extra data ("invalid extra data field size for tag: 0x… at <offset>"),
+  a zip64 extra field whose size is not exactly what the record's markers call
+  for or that holds a negative size or offset, a marker on a record with no
+  extra data, and a name or comment that is not valid UTF-8.
+
+OpenJDK 21 opens some archives OpenJDK 25 refuses: it has no 65,535-byte
+header check, no check of a zip64 marker on a record without extra data, and
+does not require a zip64 extra field's size to match the record's markers
+exactly. It does make the other zip64 extra-field checks.
+
+A member is read as `ZipFile.getInputStream` reads it: its compressed size
+from the central directory, from just past its local header's name and extra
+field, stopping early at the end of the file, inflated when deflated. The local
+header's flags, sizes and method are not compared with the central directory
+and the CRC-32 is not checked, as the JDK checks neither; ZIP external
+attributes, such as a symlink or directory mode, do not change how a member is
+read. A local header without its signature, or deflated data that ends early
+or is invalid, is refused with the JDK's exception. REA still refuses, where
+the JDK reads, a JAR holding more than one member with the selected stored
+name (the JDK reads the last one; REA treats the selection as ambiguous). JAR
+signatures are not verified, so REA reads a class `JarFile` would refuse to
+read for a digest mismatch in a signed JAR.
 
 A JAR is multi-release exactly when the JDK's `JarFile.isMultiRelease()` would
 say so (OpenJDK 25, default settings): the manifest is the member stored as
@@ -80,13 +106,13 @@ main section parses as `java.util.jar.Attributes` does with a last
 in the main section, such as a missing space after a colon, an invalid
 attribute name, a byte-order mark, or a line longer than the JDK's line buffer,
 makes the JAR not multi-release, as does a manifest declaring more than the
-JDK's default `jdk.jar.maxSignatureFileSize` of 16,000,000 bytes. Like the JDK,
-REA ignores ZIP external attributes: only a trailing `/` makes a member a
-directory, so a manifest or class member marked as a directory by Unix-mode or
-MS-DOS attributes is read as a file. A manifest REA cannot read, such as one
-stored as a symlink, leaves the multi-release status
-unknown: a call that needs it is refused as unsupported rather than treating the
-JAR as not multi-release. A release is a
+JDK's default `jdk.jar.maxSignatureFileSize` of 16,000,000 bytes. The manifest
+is read as `JarFile.getBytes` reads it: a declared size of at most 65,535
+bytes is trusted and only that many bytes are read; otherwise a byte count
+other than the declared size, or a read the JDK fails, makes the JAR not
+multi-release, as `isMultiRelease()` then answers false. Like the JDK, REA
+ignores ZIP external attributes: only a trailing `/` makes a member a
+directory. A release is a
 `META-INF/versions/<N>/` directory whose `<N>` is a decimal number from 9 to
 2147483647 without leading zeros; other directories are inert resources. REA
 lists every such release present, while a running JDK only consults versions
@@ -252,12 +278,12 @@ refused as invalid input, as HotSpot refuses it, as is a class whose
 `constant_pool_count` is 0, whose last constant-pool slot holds a `long` or
 `double` (its second slot would lie outside the pool), or whose field, method
 or class attribute has a name index that does not name a `CONSTANT_Utf8`
-entry. A JAR whose central directory
-exceeds the metadata read budget, or whose manifest and selected class (the
-only members REA decompresses) declare more uncompressed bytes than its
-decompression budget allows, is refused with that bound named in
-`reported_limits` (`max_metadata_read_bytes` or `max_decompressed_bytes`);
-other members' declared sizes are not charged, as the JDK does not read them.
+entry. A JAR whose central directory exceeds the metadata read budget, or
+whose manifest and selected class (the only members REA reads) expand past its
+decompression budget, is refused with that bound named in `reported_limits`
+(`max_metadata_read_bytes` or `max_decompressed_bytes`). The budget charges
+the bytes REA produces, not what members declare, as the JDK reads a member
+whatever its declared size.
 
 Verified by the `verify:jvm` real lane, which compiles owned `javac` fixtures
 with `-g` and `-g:none` and cross-checks the decoded facts against `javap` —

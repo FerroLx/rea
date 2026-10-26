@@ -12,12 +12,14 @@ import type {
   JvmDebugMetadataExecution,
   JvmDebugMetadataPort,
 } from "../application/jvm/JvmDebugMetadataPort.js";
-import {
-  ArtifactReaderFailure,
-  type ArtifactEntry,
-} from "../artifacts/ArtifactReader.js";
+import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
 import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
-import { ZipArtifactReader } from "../artifacts/ZipArtifactReader.js";
+import {
+  JdkZipFile,
+  JdkZipReadFailure,
+  type JdkZipMember,
+} from "../artifacts/JdkZipFile.js";
+import { describeJdkZipException } from "../artifacts/JdkZipCentralDirectory.js";
 import type { StableRegularFileDescriptor } from "../filesystem/RegularFile.js";
 import {
   peekArtifactMagic,
@@ -40,7 +42,6 @@ import {
 } from "../domain/jvm/javaDebugMetadataReport.js";
 import { err, ok, type Result } from "../domain/result.js";
 import { hashStableRootArtifactHandle } from "../artifacts/inventory/hashStableRootArtifact.js";
-import { AnalysisCleanupLease } from "../artifacts/AnalysisCleanupLease.js";
 import {
   assertArtifactReadActive,
   bindArtifactFileCleanup,
@@ -251,16 +252,15 @@ export class JvmClassFileProvider implements JvmDebugMetadataPort {
   /**
    * Read one member under the admitted descriptor. Every outcome, including a
    * thrown read failure, becomes this inspection's result so the descriptor
-   * close can never replace it; the ZIP reader is released through a lease the
-   * provider scope retains if its close fails.
+   * close can never replace it. The JAR is opened as OpenJDK 25's `ZipFile`
+   * opens it ({@link JdkZipFile}), which holds nothing beyond that descriptor.
    */
   async #readJar(
     source: StableRegularFileDescriptor,
     request: JarRequest,
   ): Promise<JarInspection> {
     const { jar, signal } = request;
-    const { initial } = source;
-    if (initial.size > JVM_LIMITS.archiveBytes)
+    if (source.initial.size > JVM_LIMITS.archiveBytes)
       return new JarInspection(
         err(
           new AnalysisResourceConstraintError(
@@ -271,49 +271,27 @@ export class JvmClassFileProvider implements JvmDebugMetadataPort {
           ),
         ),
       );
-    const reader = new ZipArtifactReader(
-      jar,
-      "zip",
-      JVM_LIMITS.archiveMetadataBytes,
-      source,
-      {
-        // Name members as JarFile names them (UTF-8), and refuse the archive
-        // for every central-directory record JarFile's index rejects (an
-        // invalid name or comment, encryption, a compression method other
-        // than stored or deflated, an oversized header, or a malformed extra
-        // field), whichever member is requested.
-        view: "jdk",
-        // Only the manifest and the selected class are decompressed, so only
-        // they are charged; an unrelated large member cannot refuse the read.
-        expansion: "opened",
-      },
-    );
-    const readerLease = new AnalysisCleanupLease(() => reader.close());
-    let result: Result<JvmDebugMetadataExecution, AnalysisError>;
     try {
-      result = await this.#readJarMember(request, reader, source);
+      const file = await JdkZipFile.open(
+        jar,
+        source,
+        JVM_LIMITS.archiveMetadataBytes,
+        signal,
+      );
+      return new JarInspection(
+        await this.#readJarMember(request, file, source),
+      );
     } catch (cause: unknown) {
-      result = err(jvmClassFileFailure(cause, jar, signal));
+      return new JarInspection(err(jvmClassFileFailure(cause, jar, signal)));
     }
-    const released = await this.#resources.release({
-      kind: "lease",
-      resource: jar,
-      lease: readerLease,
-    });
-    return new JarInspection(
-      result,
-      released.kind === "released"
-        ? undefined
-        : { cause: released.cause, lease: readerLease },
-    );
   }
 
   async #readJarMember(
     { jar, entry, input, signal }: JarRequest,
-    reader: ZipArtifactReader,
+    file: JdkZipFile,
     { handle, initial }: StableRegularFileDescriptor,
   ): Promise<Result<JvmDebugMetadataExecution, AnalysisError>> {
-    const selected = await this.#selectJarMember(reader, {
+    const selected = await this.#selectJarMember(file, {
       jar,
       entry,
       input,
@@ -321,8 +299,8 @@ export class JvmClassFileProvider implements JvmDebugMetadataPort {
     });
     if (!selected.ok) return selected;
     assertArtifactReadActive(signal);
-    const classBytes = await this.#readEntryBytes(
-      reader,
+    const classBytes = await this.#readClassBytes(
+      file,
       selected.value.member,
       signal,
     );
@@ -376,39 +354,34 @@ export class JvmClassFileProvider implements JvmDebugMetadataPort {
    * versioned selection, an absent release, or an ambiguous duplicate.
    */
   async #selectJarMember(
-    reader: ZipArtifactReader,
+    file: JdkZipFile,
     { jar, entry, input, signal }: JarRequest,
   ): Promise<
     Result<
       {
-        readonly member: ArtifactEntry;
+        readonly member: JdkZipMember;
         readonly release: number | null;
-        /** Reader notes on the member and any note on the manifest decision. */
+        /** Any note on the manifest decision. */
         readonly limitations: readonly string[];
       },
       AnalysisError
     >
   > {
     const requestedRelease = input.release;
-    let manifestEntry: ArtifactEntry | undefined;
-    const byRelease = new Map<number | null, ArtifactEntry[]>();
-    for await (const member of reader.entries(signal)) {
+    let manifestEntry: JdkZipMember | undefined;
+    const byRelease = new Map<number | null, JdkZipMember[]>();
+    for (const member of file.members) {
       // The JDK finds members by stored name and ignores external attributes,
-      // so every kind is matched here; an unreadable match (a symlink the
-      // reader does not read) is reported as such, never absent. The JDK view
-      // has already refused an archive holding any encrypted record.
-      // The manifest matches in any ASCII case and the last such member wins;
-      // a `./`-prefixed name is not the manifest.
-      if (isJarManifestName(member.storedPath ?? member.path)) {
+      // so every member is matched by name alone. The manifest matches in any
+      // ASCII case and the last such member wins; a `./`-prefixed name is not
+      // the manifest.
+      if (isJarManifestName(member.name)) {
         manifestEntry = member;
         continue;
       }
       // Class entries match on the stored name too: a `./`-prefixed member is
       // an inert resource for the JDK, never the entry or its override.
-      const candidate = classifyJarEntry(
-        member.storedPath ?? member.path,
-        entry,
-      );
+      const candidate = classifyJarEntry(member.name, entry);
       if (candidate === undefined) continue;
       const members = byRelease.get(candidate.release) ?? [];
       members.push(member);
@@ -416,7 +389,7 @@ export class JvmClassFileProvider implements JvmDebugMetadataPort {
     }
     // The full stored-name scan found no member for the entry at any
     // release, so no manifest can make one selectable: the entry is
-    // definitely absent, even when the manifest itself is unreadable.
+    // definitely absent, and the manifest need not be read.
     if (byRelease.size === 0)
       return err(
         this.#selectionError(
@@ -427,24 +400,16 @@ export class JvmClassFileProvider implements JvmDebugMetadataPort {
         ),
       );
     // Without a requested release, a present base entry is selected whatever
-    // the manifest says, so an unreadable manifest must not block it. A
-    // versioned spelling of the entry needs it to know what the member means.
+    // the manifest says, so it is not read. A versioned spelling of the entry
+    // needs it to know what the member means.
     const versionedEntry = parseVersionedJarEntry(entry);
     const needsManifest =
       requestedRelease !== undefined ||
       !byRelease.has(null) ||
       versionedEntry !== undefined;
     const manifest = needsManifest
-      ? await this.#readManifest(reader, manifestEntry, signal)
+      ? await this.#readManifest(file, manifestEntry, signal)
       : ({ kind: "not-read" } as const);
-    if (manifest.kind === "unknown")
-      return err(
-        new AnalysisUnsupportedTargetError(
-          OPERATION,
-          jar,
-          `${manifest.reason}; REA cannot read it, so whether ${jar} is a multi-release JAR is unknown and its META-INF/versions entries cannot be resolved.`,
-        ),
-      );
     const multiRelease = manifest.kind === "multi-release";
     const manifestNotes =
       manifest.kind === "not-multi-release" && manifest.note !== undefined
@@ -468,7 +433,7 @@ export class JvmClassFileProvider implements JvmDebugMetadataPort {
         ),
       );
     // Outside a multi-release JAR, versioned entries never load; drop them.
-    const effective = new Map<number | null, ArtifactEntry[]>();
+    const effective = new Map<number | null, JdkZipMember[]>();
     if (multiRelease) for (const [r, m] of byRelease) effective.set(r, m);
     else {
       const base = byRelease.get(null);
@@ -476,7 +441,7 @@ export class JvmClassFileProvider implements JvmDebugMetadataPort {
     }
     const candidates = [...effective.entries()].map(([release, members]) => ({
       release,
-      path: members[0]!.storedPath ?? members[0]!.path,
+      path: members[0]!.name,
     }));
     const selection = resolveJarSelection(candidates, requestedRelease);
     if (!selection.ok)
@@ -489,54 +454,58 @@ export class JvmClassFileProvider implements JvmDebugMetadataPort {
           `${jar} holds ${String(selectedMembers.length)} members at the selected entry and release; the identity is ambiguous, so no member is chosen.`,
         ),
       );
-    const member = selectedMembers[0]!;
-    if (member.kind !== "file")
-      return err(
-        new AnalysisUnsupportedTargetError(
-          OPERATION,
-          jar,
-          `The selected entry ${entry} is stored as a ZIP ${member.kind}, which REA does not read as member bytes; its debug metadata is unavailable, not absent.`,
-        ),
-      );
     return ok({
-      member,
+      member: selectedMembers[0]!,
       release: selection.release,
-      limitations: [...member.limitations, ...manifestNotes],
+      limitations: manifestNotes,
     });
   }
 
   /**
-   * Decide the JDK's multi-release status from the last manifest member. A
-   * manifest REA cannot read leaves that status unknown, never false.
+   * Decide `JarFile.isMultiRelease()` from the last manifest member, as
+   * `checkForSpecialAttributes` reads it through `JarFile.getBytes`: a
+   * declared size over `jdk.jar.maxSignatureFileSize`, a read the JDK fails,
+   * or a byte count other than the declared size is an `IOException` there,
+   * and `isMultiRelease()` then answers false. A declared size of at most
+   * 65,535 bytes is trusted: only that many bytes are read.
    */
   async #readManifest(
-    reader: ZipArtifactReader,
-    manifest: ArtifactEntry | undefined,
+    file: JdkZipFile,
+    manifest: JdkZipMember | undefined,
     signal: AbortSignal | undefined,
   ): Promise<
     | { readonly kind: "multi-release" }
     | { readonly kind: "not-multi-release"; readonly note?: string }
-    | { readonly kind: "unknown"; readonly reason: string }
   > {
     if (manifest === undefined) return { kind: "not-multi-release" };
-    const name = JSON.stringify(manifest.storedPath ?? manifest.path);
-    if (manifest.kind !== "file")
-      return {
-        kind: "unknown",
-        reason: `The JAR manifest member ${name} is stored as a ZIP ${manifest.kind}, which the JDK reads as a file but REA does not read`,
-      };
-    if (
-      manifest.declaredSize !== null &&
-      manifest.declaredSize > JDK_DEFAULT_MAX_MANIFEST_BYTES
-    )
-      return {
+    const name = JSON.stringify(manifest.name);
+    const notMultiRelease = (reason: string) =>
+      ({
         kind: "not-multi-release",
-        note: `the JAR manifest ${name} declares ${String(manifest.declaredSize)} bytes, over the JDK's default jdk.jar.maxSignatureFileSize of ${String(JDK_DEFAULT_MAX_MANIFEST_BYTES)} bytes, so JarFile.isMultiRelease() is false at default settings`,
-      };
+        note: `${reason}, so JarFile.isMultiRelease() is false at default settings`,
+      }) as const;
+    if (manifest.size > BigInt(JDK_DEFAULT_MAX_MANIFEST_BYTES))
+      return notMultiRelease(
+        `the JAR manifest ${name} declares ${String(manifest.size)} bytes, over the JDK's default jdk.jar.maxSignatureFileSize of ${String(JDK_DEFAULT_MAX_MANIFEST_BYTES)} bytes`,
+      );
+    const declared = Number(manifest.size);
+    // Reading one byte past a larger declared size proves the mismatch.
+    const limit = declared <= 65_535 ? declared : declared + 1;
+    let bytes: Uint8Array;
+    try {
+      bytes = await this.#readMemberBytes(file, manifest, limit, signal);
+    } catch (cause: unknown) {
+      if (!(cause instanceof JdkZipReadFailure)) throw cause;
+      return notMultiRelease(
+        `the JDK cannot read the JAR manifest ${name} (${describeJdkZipException(cause.jdk)})`,
+      );
+    }
+    if (bytes.length !== declared)
+      return notMultiRelease(
+        `the JAR manifest ${name} declares ${String(declared)} bytes but holds ${bytes.length > declared ? "more" : `only ${String(bytes.length)}`}, which JarFile.getBytes refuses (EOFException)`,
+      );
     return {
-      kind: isMultiReleaseManifest(
-        await this.#readEntryBytes(reader, manifest, signal),
-      )
+      kind: isMultiReleaseManifest(bytes)
         ? "multi-release"
         : "not-multi-release",
     };
@@ -548,43 +517,46 @@ export class JvmClassFileProvider implements JvmDebugMetadataPort {
     ]);
   }
 
-  /** Buffer one archive member, bounded by the class-file input budget. */
-  async #readEntryBytes(
-    reader: ZipArtifactReader,
-    member: ArtifactEntry,
+  /** Buffer the selected class member, bounded by the class-file input budget. */
+  async #readClassBytes(
+    file: JdkZipFile,
+    member: JdkZipMember,
     signal: AbortSignal | undefined,
   ): Promise<Uint8Array> {
-    const stream = await reader.open(member, signal);
-    const chunks: Buffer[] = [];
+    const bytes = await this.#readMemberBytes(
+      file,
+      member,
+      JVM_LIMITS.inputBytes + 1,
+      signal,
+    );
+    if (bytes.length > JVM_LIMITS.inputBytes)
+      throw new ArtifactReaderFailure(
+        "limit",
+        `Selected class entry exceeds ${String(JVM_LIMITS.inputBytes)} bytes`,
+        {
+          boundary: "file-size",
+          limit: { key: "max_input_bytes", maximum: JVM_LIMITS.inputBytes },
+        },
+      );
+    return bytes;
+  }
+
+  /** Read a member's first `limit` bytes (all of them when it holds fewer). */
+  async #readMemberBytes(
+    file: JdkZipFile,
+    member: JdkZipMember,
+    limit: number,
+    signal: AbortSignal | undefined,
+  ): Promise<Uint8Array> {
+    const chunks: Uint8Array[] = [];
     let size = 0;
-    for await (const chunk of stream) {
-      if (signal?.aborted) {
-        stream.destroy();
-        throw new ArtifactReaderFailure("cancelled", "JAR read cancelled", {
-          cause: signal.reason,
-        });
+    if (limit > 0)
+      for await (const chunk of file.read(member, signal)) {
+        const take = Math.min(chunk.length, limit - size);
+        chunks.push(chunk.subarray(0, take));
+        size += take;
+        if (size >= limit) break;
       }
-      if (!Buffer.isBuffer(chunk)) {
-        stream.destroy();
-        throw new ArtifactReaderFailure(
-          "format",
-          "JAR entry did not yield bytes",
-        );
-      }
-      size += chunk.length;
-      if (size > JVM_LIMITS.inputBytes) {
-        stream.destroy();
-        throw new ArtifactReaderFailure(
-          "limit",
-          `Selected class entry exceeds ${String(JVM_LIMITS.inputBytes)} bytes`,
-          {
-            boundary: "file-size",
-            limit: { key: "max_input_bytes", maximum: JVM_LIMITS.inputBytes },
-          },
-        );
-      }
-      chunks.push(chunk);
-    }
     return Buffer.concat(chunks, size);
   }
 

@@ -65,8 +65,8 @@ order, projection, layering, reuse, effect audit, and the deferral seam.
 
 ## JAR entry + multi-release (landed)
 
-`entry` selects one class member from a `.jar` (read through the shared
-`ZipArtifactReader`), and `release` selects a `META-INF/versions/<N>/` override.
+`entry` selects one class member from a `.jar` (read through the JDK-faithful
+`JdkZipFile`, see below), and `release` selects a `META-INF/versions/<N>/` override.
 Selection is explicit and non-combining: an omitted release reads the base; a
 requested release must match a present override or the call is refused with the
 available versions (`resolveJarSelection`, unit-tested). The JAR's digest is
@@ -222,13 +222,14 @@ patched `javac` classes through a `URLClassLoader`) and fixed:
 
 - `new JarFile(...)` throws "invalid CEN header (encrypted entry)" when any
   central-directory record sets flag bit 0, whichever member is requested (a
-  local-header-only flag is ignored). The JDK view of the shared ZIP reader now
-  refuses such an archive during enumeration.
+  local-header-only flag is ignored). REA now refuses such an archive when
+  opening it (first through a JDK view of the shared ZIP reader, since
+  replaced by the JDK-faithful reader below).
 - `JarFile` reads a class whatever unrelated members declare. The JVM provider
-  now charges the decompression budget only for members it opens (the manifest
-  and the selected class); entry count and central-directory size stay bounded
-  by the metadata read budget. Other ZIP consumers keep enumeration-time
-  accounting.
+  now charges the decompression budget only for members it reads (the manifest
+  and the selected class), by the bytes it produces; the central-directory size
+  stays bounded by the metadata read budget. Other ZIP consumers keep
+  enumeration-time accounting.
 - `JarFile.getEntry` never versions a `META-INF/` name, so
   `META-INF/versions/<N>/META-INF/...` is a plain member, not an override.
 - From class version 51 HotSpot's verifier rejects a `LocalVariableTable` scope
@@ -271,11 +272,42 @@ outcomes:
   end at its last record. zip.js already refuses a bad record signature and
   any zip64 value above 2^53 − 1 (stricter than the JDK). Each was checked
   against `new JarFile(...)` on crafted archives.
-- REA stays stricter than `JarFile` where zip.js cross-checks the local header
+- (Superseded by the JDK-faithful reader below.) REA stayed stricter than `JarFile` where zip.js cross-checks the local header
   or the data of a member it reads (the manifest or the selected class): a
   local-only encryption flag, local/central size or method mismatch, or a
   CRC-32 mismatch; and on any record, a zip64 value above 2^53 − 1. REA refuses
   those JARs as malformed rather than answering.
+
+## Second audit follow-up: a JDK-faithful JAR reader
+
+The JDK view built on zip.js could not follow OpenJDK where zip.js reads the
+END and directory differently: it reconciled a zip64 END without markers into
+a "trailing directory data" warning (refusing JARs Commons Compress writes),
+listed only ENDTOT records (missing members the JDK recounts), refused END
+disk numbers the JDK ignores, cross-checked local headers and CRCs the JDK
+never reads, and accepted archives whose END the JDK refuses. REA now opens a
+JAR with its own reader (`JdkZipCentralDirectory`, `JdkZipFile`) reproducing
+OpenJDK 25.0.4's `ZipFile.Source.findEND`, `initCEN`, `checkAndAddEntry`,
+`checkExtraFields`, `countCENHeaders` and `ZipFileInputStream`
+(`checkZIP64`, `initDataOffset`), read from the JDK 25 source and checked
+against its bytecode. The provider's manifest handling follows
+`JarFile.getBytes` (a declared size up to 65,535 bytes is trusted; otherwise a
+mismatch or a failed read is an `IOException`, so `isMultiRelease()` is
+false), and ZIP external attributes no longer change how a member is read.
+The shared `ZipArtifactReader` is back to its single ZIP-specification view
+and no other consumer changed.
+
+`copy_localvariable_table` is modelled too: when the `LocalVariableTable`
+declares rows, a repeated `LocalVariableTable` key (version 49+), a type-table
+row matching no key, and two type-table rows matching one key make the
+respective table `malformed`.
+
+Agreement with OpenJDK 25 `new JarFile(...)` plus `getInputStream` over 144
+crafted JARs (both audits' sets, the auditor's real-tool JARs and REA's own):
+142 give the JDK's verdict and, where the JDK reads the member, its exact
+SHA-256 (with an explicit `release` where the JDK picks a versioned
+override). The two left are REA design: a duplicate stored name is refused as
+ambiguous, and a JAR holding only versioned overrides requires a release.
 
 ## Still owed (follow-ups, not blocking)
 

@@ -349,7 +349,9 @@ cliTest(
           issues: [
             {
               reason: "invalid_format",
-              message: expect.stringContaining("not valid UTF-8") as string,
+              message: expect.stringContaining(
+                "invalid CEN header (bad entry name or comment)",
+              ) as string,
             },
           ],
         },
@@ -361,63 +363,127 @@ cliTest(
 );
 
 cliTest(
-  "charges only the JAR members it decompresses to the ZIP budget over CLI and MCP",
+  "reads JAR members by their bytes, whatever they declare, over CLI and MCP",
   async ({ cli }) => {
     const root = await createTestTempDirectory("rea-jvm-zip-limit-");
     const { client, call } = await connectLocalToolsMcp();
     // A member declaring 300 MiB is past the 256 MiB minimum decompression
-    // budget of a small archive. JarFile reads Example.class whatever an
-    // unrelated member declares, and REA only decompresses the manifest and
-    // the selected class.
-    const big = {
-      name: Buffer.from("big.bin"),
-      bytes: Buffer.from("x"),
-      declaredSize: 300 * 1024 * 1024,
+    // budget of a small archive. OpenJDK 21/25 JarFile reads Example.class
+    // whatever an unrelated member declares, and reads the class's own bytes
+    // whatever it declares itself: the budget charges bytes REA produces.
+    const declaresMore = 300 * 1024 * 1024;
+    const example = {
+      name: Buffer.from("Example.class"),
+      bytes: jvmDebugClass(),
     };
-    const unrelated = join(root, "unrelated-large.jar");
-    await writeFile(
-      unrelated,
-      storedZip([
-        { name: Buffer.from("Example.class"), bytes: jvmDebugClass() },
-        big,
-      ]),
-    );
-    const read = await inspectBoth(cli, call, {
-      path: unrelated,
-      entry: "Example.class",
-    });
-    if (!read.ok) throw new Error(JSON.stringify(read.error));
-    expect(read.evidence).toMatchObject({
-      normalized_result: { selected_entry: { entry: "Example.class" } },
-    });
-    // The selected member itself declaring that much is refused before it is
-    // decompressed, with the bound it exceeds.
-    const selected = join(root, "selected-large.jar");
-    await writeFile(
-      selected,
-      storedZip([{ ...big, name: Buffer.from("Example.class") }]),
-    );
-    const outcome = await inspectBoth(cli, call, {
-      path: selected,
-      entry: "Example.class",
-    });
-    expect(outcome).toMatchObject({
-      ok: false,
-      error: {
-        code: "resource_constraint",
-        details: {
-          resource: "capacity",
-          reported_limits: { max_decompressed_bytes: 256 * 1024 * 1024 },
+    const archives = {
+      unrelated: storedZip([
+        example,
+        {
+          name: Buffer.from("big.bin"),
+          bytes: Buffer.from("x"),
+          declaredSize: declaresMore,
         },
-      },
-    });
-    expect(
-      (outcome as { error: { details: { reported_limits: object } } }).error
-        .details.reported_limits,
-    ).not.toHaveProperty("max_input_bytes");
+      ]),
+      selected: storedZip([{ ...example, declaredSize: declaresMore }]),
+    };
+    for (const [name, bytes] of Object.entries(archives)) {
+      const path = join(root, `${name}-declares-more.jar`);
+      await writeFile(path, bytes);
+      const read = await inspectBoth(cli, call, {
+        path,
+        entry: "Example.class",
+      });
+      if (!read.ok) throw new Error(JSON.stringify(read.error));
+      expect(read.evidence).toMatchObject({
+        normalized_result: {
+          selected_entry: {
+            entry: "Example.class",
+            sha256: createHash("sha256").update(example.bytes).digest("hex"),
+          },
+        },
+      });
+    }
     await client.ping();
   },
   30000,
+);
+
+cliTest(
+  "opens a JAR wherever OpenJDK 25 JarFile opens it, and only there, over CLI and MCP",
+  async ({ cli }) => {
+    const root = await createTestTempDirectory("rea-jvm-end-");
+    const { client, call } = await connectLocalToolsMcp();
+    const members = [
+      {
+        name: Buffer.from("META-INF/MANIFEST.MF"),
+        bytes: Buffer.from("Manifest-Version: 1.0\r\n\r\n"),
+      },
+      { name: Buffer.from("Example.class"), bytes: jvmDebugClass() },
+      { name: Buffer.from("other.txt"), bytes: Buffer.from("x") },
+    ];
+    const opens = {
+      // ZipFile.initCEN recounts the records when ENDTOT is too small.
+      "endtot-1-of-3": storedZip(members, { endTotal: 1 }),
+      // A zip64 END and locator whose END holds real values, as Commons
+      // Compress writes with Zip64Mode.Always.
+      "zip64-end-without-markers": storedZip(members, { zip64End: {} }),
+      // The JDK ignores END's disk numbers.
+      "end-disk-1": storedZip(members, { endDisk: 1 }),
+      // Only the central directory's facts matter: a local-header-only
+      // encryption flag and a wrong CRC are never read.
+      "local-flag-and-crc": storedZip([
+        { ...members[1]!, localFlags: 1, crc: 1 },
+      ]),
+    };
+    for (const [name, bytes] of Object.entries(opens)) {
+      const path = join(root, `${name}.jar`);
+      await writeFile(path, bytes);
+      const read = await inspectBoth(cli, call, {
+        path,
+        entry: "Example.class",
+      });
+      if (!read.ok) throw new Error(`${name}: ${JSON.stringify(read.error)}`);
+    }
+    const refused = {
+      "end-offset-past-start": [
+        storedZip(members, { directoryOffsetDelta: 10 }),
+        "java.util.zip.ZipException: invalid END header (bad central directory offset)",
+      ],
+      "end-comment-past-eof": [
+        storedZip(members, { commentLength: 5 }),
+        "java.io.EOFException",
+      ],
+      "endtot-past-cenlen": [
+        storedZip(members, { endTotal: 4 }),
+        "java.util.zip.ZipException: invalid END header (total entries count too large)",
+      ],
+    } as const;
+    for (const [name, [bytes, refusal]] of Object.entries(refused)) {
+      const path = join(root, `${name}.jar`);
+      await writeFile(path, bytes);
+      expect(
+        await inspectBoth(cli, call, { path, entry: "Example.class" }),
+        name,
+      ).toMatchObject({
+        ok: false,
+        error: {
+          code: "invalid_request",
+          details: {
+            issues: [
+              {
+                path: ["path"],
+                reason: "invalid_format",
+                message: expect.stringContaining(refusal) as string,
+              },
+            ],
+          },
+        },
+      });
+    }
+    await client.ping();
+  },
+  60000,
 );
 
 cliTest(

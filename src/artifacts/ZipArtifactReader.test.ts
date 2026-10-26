@@ -13,7 +13,6 @@ import {
 } from "@zip.js/zip.js";
 import { describe, expect, it, vi } from "vitest";
 
-import { storedZip } from "../../tests/fixtures/storedZip.js";
 import { createTestTempDirectory } from "../../tests/fixtures/temporaryDirectory.js";
 
 import { ZipArtifactReader } from "./ZipArtifactReader.js";
@@ -404,113 +403,6 @@ const listEntries = async (path: string) => {
     await reader.close();
   }
 };
-
-describe("ZipArtifactReader opened expansion accounting", () => {
-  it("charges only opened members under opened accounting", async () => {
-    const directory = await createTestTempDirectory("rea-zip-budget-opened-");
-    // member-0 truthfully declares its 17 bytes; member-1 declares 2 GiB.
-    const path = await writeZipWithDeclaredSize(directory, [17, 2_147_483_647]);
-    const reader = new ZipArtifactReader(path, "zip", undefined, undefined, {
-      expansion: "opened",
-    });
-    try {
-      const entries = [];
-      for await (const entry of reader.entries()) entries.push(entry);
-      expect(entries).toHaveLength(2);
-      const chunks: Buffer[] = [];
-      for await (const chunk of await reader.open(entries[0]!))
-        chunks.push(Buffer.from(chunk));
-      expect(Buffer.concat(chunks).toString()).toBe("real member bytes");
-      await expect(reader.open(entries[1]!)).rejects.toMatchObject({
-        reason: "limit",
-        boundary: "capacity",
-        limit: {
-          key: "max_decompressed_bytes",
-          maximum: MINIMUM_ARTIFACT_EXPANDED_BYTES,
-        },
-      });
-    } finally {
-      await reader.close();
-    }
-  });
-});
-
-describe("ZipArtifactReader JDK view", () => {
-  it("refuses enumeration when any record is encrypted, as JarFile does", async () => {
-    const directory = await createTestTempDirectory("rea-zip-jdk-encrypted-");
-    const path = join(directory, "encrypted.zip");
-    const writer = new ZipWriter(new Uint8ArrayWriter());
-    await writer.add("plain.txt", new TextReader("plain"));
-    await writer.add("secret.txt", new TextReader("secret"), {
-      password: "key",
-    });
-    await writeFile(path, await writer.close());
-    const legacy = new ZipArtifactReader(path, "zip");
-    const jdk = new ZipArtifactReader(path, "zip", undefined, undefined, {
-      view: "jdk",
-    });
-    try {
-      expect(await enumerate(legacy)).toBe(2);
-      await expect(enumerate(jdk)).rejects.toMatchObject({
-        reason: "format",
-        message: expect.stringContaining(
-          "invalid CEN header (encrypted entry)",
-        ) as string,
-      });
-    } finally {
-      await legacy.close();
-      await jdk.close();
-    }
-  });
-});
-
-describe("ZipArtifactReader JDK view central-directory records", () => {
-  const zip64 = (values: readonly bigint[]): Buffer => {
-    const field = Buffer.alloc(4 + values.length * 8);
-    field.writeUInt16LE(0x0001, 0);
-    field.writeUInt16LE(values.length * 8, 2);
-    values.forEach((value, index) =>
-      field.writeBigUInt64LE(value, 4 + index * 8),
-    );
-    return field;
-  };
-  // OpenJDK 25 `new JarFile(...)` verdicts on the same archives.
-  it.each([
-    ["a zip64 block holding exactly the escaped size", [1n], null],
-    [
-      "a zip64 block longer than the escaped values",
-      [1n, 1n],
-      "invalid zip64 extra data field size",
-    ],
-  ] as const)("judges %s as the JDK does", async (_label, values, refusal) => {
-    const directory = await createTestTempDirectory("rea-zip-jdk-zip64-");
-    const path = join(directory, "zip64.zip");
-    await writeFile(
-      path,
-      storedZip([
-        {
-          name: Buffer.from("member.txt"),
-          bytes: Buffer.from("x"),
-          declaredSize: 0xffffffff,
-          centralExtra: zip64(values),
-        },
-      ]),
-    );
-    const reader = new ZipArtifactReader(path, "zip", undefined, undefined, {
-      view: "jdk",
-    });
-    try {
-      if (refusal === null) expect(await enumerate(reader)).toBe(1);
-      else
-        await expect(enumerate(reader)).rejects.toMatchObject({
-          reason: "format",
-          message: expect.stringContaining(refusal) as string,
-        });
-    } finally {
-      await reader.close();
-    }
-  });
-});
 
 describe("ZipArtifactReader member names", () => {
   it("keeps the raw central-directory name as storedPath when a Unicode Path field renames the member", async () => {

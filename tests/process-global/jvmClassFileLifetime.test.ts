@@ -47,7 +47,6 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 
 import { JvmClassFileProvider } from "../../src/jvm/JvmClassFileProvider.js";
 import { JvmDebugMetadataService } from "../../src/application/jvm/JvmDebugMetadataService.js";
-import { ZipArtifactReader } from "../../src/artifacts/ZipArtifactReader.js";
 import { AnalysisError } from "../../src/domain/analysisErrorBase.js";
 import {
   AnalysisCancelledError,
@@ -288,27 +287,6 @@ it("JAR entry: cancellation during admission is typed cancellation with the call
   } finally {
     await provider.close();
   }
-});
-
-it("JAR entry: a failed ZIP reader close is retained, reported with the Evidence, and retried by close()", async () => {
-  const path = await jarFile();
-  const provider = new JvmClassFileProvider();
-  const readerClose = vi
-    .spyOn(ZipArtifactReader.prototype, "close")
-    .mockRejectedValueOnce(new Error("controlled ZIP reader close failure"));
-  const result = await provider.inspect({ path, entry: ENTRY });
-  if (result.ok) throw new Error("Expected unconfirmed reader cleanup");
-  expect(result.error).toBeInstanceOf(ProviderCleanupError);
-  expect(result.error.cleanupResources).toEqual([path]);
-  expect(result.error.partialObservation).toMatchObject({
-    parameters: { path, entry: ENTRY },
-  });
-  expect(result.error.cleanupIncomplete).toBe(true);
-  // The archive descriptor itself closed; only the reader stays owned.
-  expect(fault.handles.every((handle) => handle.fd === -1)).toBe(true);
-  await provider.close();
-  expect(readerClose).toHaveBeenCalledTimes(2);
-  expect(result.error.cleanupIncomplete).toBe(false);
 });
 
 it("service: late cancellation keeps the abort reason and the validated Evidence", async () => {

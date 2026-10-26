@@ -13,6 +13,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { JvmClassFileProvider } from "./JvmClassFileProvider.js";
 import type { AnalysisInputError } from "../domain/analysisErrorCore.js";
 import { CONSTANT_TAG } from "../domain/jvm/javaClassFile.js";
+import { storedZip } from "../../tests/fixtures/storedZip.js";
 
 /** Minimal valid class named com/example/Foo at the given major version. */
 const minimalClass = (major: number): Uint8Array => {
@@ -504,7 +505,9 @@ describe("JvmClassFileProvider manifest member attributes", () => {
     expect(r.class.major_version).toBe(61);
   });
 
-  it("reports multi-release status as unknown, not absent, for a symlink-moded manifest", async () => {
+  // OpenJDK 21/25 ignore external attributes: a symlink-moded manifest is
+  // read like any member, and the JAR is multi-release.
+  it("honors a symlink-moded manifest as JarFile does", async () => {
     const result = await provider.inspect({
       path: await jarWithManifestAttributes("symlink-manifest.jar", {
         externalFileAttributes: 0o120777 * 0x10000,
@@ -512,20 +515,20 @@ describe("JvmClassFileProvider manifest member attributes", () => {
       entry: ENTRY,
       release: 17,
     });
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
-    expect(result.error._tag).toBe("AnalysisUnsupportedTargetError");
-    expect(result.error.message).toContain("is stored as a ZIP symlink");
-    expect(result.error.message).toContain("multi-release JAR is unknown");
+    if (!result.ok) throw result.error;
+    expect(result.value.result).toMatchObject({
+      selected_entry: { release: 17 },
+      class: { major_version: 61 },
+    });
   });
 
-  // The stored-name scan already proves no release holds the entry, so an
-  // unreadable manifest cannot turn a definite absence into an unknown.
+  // The stored-name scan already proves no release holds the entry, so the
+  // manifest is not needed to report a definite absence.
   it.each([
     ["without a release", undefined],
     ["with a release", 17],
   ])(
-    "reports a missing entry as not found %s, whatever an unreadable manifest says",
+    "reports a missing entry as not found %s, whatever the manifest says",
     async (_label, release) => {
       const result = await provider.inspect({
         path: await jarWithManifestAttributes("symlink-manifest-missing.jar", {
@@ -547,7 +550,7 @@ describe("JvmClassFileProvider manifest member attributes", () => {
     },
   );
 
-  it("refuses a symlink-moded class member as unavailable, not absent", async () => {
+  it("reads a symlink-moded class member as JarFile does", async () => {
     const writer = new ZipWriter(new Uint8ArrayWriter());
     await writer.add(ENTRY, new Uint8ArrayReader(minimalClass(52)), {
       externalFileAttributes: 0o120777 * 0x10000,
@@ -556,11 +559,82 @@ describe("JvmClassFileProvider manifest member attributes", () => {
       path: await writeJar("symlink-class.jar", await writer.close()),
       entry: ENTRY,
     });
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
-    expect(result.error._tag).toBe("AnalysisUnsupportedTargetError");
-    expect(result.error.message).toContain("unavailable, not absent");
+    if (!result.ok) throw result.error;
+    expect(result.value.result).toMatchObject({
+      class: { internal_name: "com/example/Foo" },
+    });
   });
+});
+
+describe("JvmClassFileProvider manifest bytes (JarFile.getBytes)", () => {
+  const VERSIONED = `META-INF/versions/17/${ENTRY}`;
+  const manifestJar = async (
+    file: string,
+    manifest: Parameters<typeof storedZip>[0][number],
+    corrupt: (bytes: Buffer) => void = () => undefined,
+  ): Promise<string> => {
+    const bytes = storedZip([
+      manifest,
+      { name: Buffer.from(ENTRY), bytes: minimalClass(52) },
+      { name: Buffer.from(VERSIONED), bytes: minimalClass(61) },
+    ]);
+    corrupt(bytes);
+    return writeJar(file, bytes);
+  };
+  const MANIFEST = Buffer.from("META-INF/MANIFEST.MF");
+
+  // OpenJDK 21/25 isMultiRelease() on the same bytes: true when a declared
+  // size of at most 65,535 bytes truncates the read, false when the member
+  // holds fewer bytes than declared or its local header cannot be read.
+  it("trusts a small declared manifest size, as JarFile.getBytes does", async () => {
+    const path = await manifestJar("manifest-short.jar", {
+      name: MANIFEST,
+      bytes: Buffer.from(`${MR_MANIFEST}trailing bytes past the declared size`),
+      declaredSize: MR_MANIFEST.length,
+    });
+    const result = await provider.inspect({ path, entry: ENTRY, release: 17 });
+    if (!result.ok) throw result.error;
+    expect(result.value.result).toMatchObject({
+      selected_entry: { release: 17 },
+    });
+  });
+
+  it.each([
+    [
+      "holds fewer bytes than it declares",
+      {
+        name: MANIFEST,
+        bytes: Buffer.from(MR_MANIFEST),
+        declaredSize: MR_MANIFEST.length + 10,
+      },
+      () => undefined,
+      "which JarFile.getBytes refuses (EOFException)",
+    ],
+    [
+      "has a local header without its signature",
+      { name: MANIFEST, bytes: Buffer.from(MR_MANIFEST) },
+      (bytes: Buffer) => bytes.writeUInt32LE(0, 0),
+      "ZipFile invalid LOC header (bad signature)",
+    ],
+  ] as const)(
+    "decides a JAR whose manifest %s is not multi-release",
+    async (_label, manifest, corrupt, note) => {
+      const path = await manifestJar("manifest-unread.jar", manifest, corrupt);
+      const result = await provider.inspect({
+        path,
+        entry: ENTRY,
+        release: 17,
+      });
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect((result.error as AnalysisInputError).issues).toEqual([
+        expect.objectContaining({
+          path: ["release"],
+          message: expect.stringContaining(note),
+        }),
+      ]);
+    },
+  );
 });
 
 describe("JvmClassFileProvider manifest size", () => {
