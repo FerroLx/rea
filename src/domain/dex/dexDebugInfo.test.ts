@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  DEX_DEBUG_PAUSED,
+  DEX_PAUSED,
   type DexDebugInfoWalk,
   type DexMethodDebug,
   type DexParameterLayout,
+  dexWorkBudget,
   startDebugInfo,
 } from "./dexDebugInfo.js";
 import {
@@ -39,7 +40,7 @@ const decodeDebugInfo = (
   );
   if (!("resume" in walk)) return walk;
   let result = walk.resume();
-  while (result === DEX_DEBUG_PAUSED) result = walk.resume();
+  while (result === DEX_PAUSED) result = walk.resume();
   return result;
 };
 
@@ -469,8 +470,75 @@ describe("DexDebugInfoWalk terminal state", () => {
     if (!("resume" in walk)) throw new Error("expected a walk");
     const first = walk.resume();
     const second = walk.resume();
-    expect(first).not.toBe(DEX_DEBUG_PAUSED);
+    expect(first).not.toBe(DEX_PAUSED);
     expect(second).toBe(first);
-    expect(second === DEX_DEBUG_PAUSED ? -1 : second.positionCount).toBe(1);
+    expect(second === DEX_PAUSED ? -1 : second.positionCount).toBe(1);
+  });
+});
+
+describe("DexDebugInfoWalk paused reference checks", () => {
+  /** A check that pauses on its first call for each index, then passes. */
+  const pausingOnce = (calls: Map<number, number>) => (idx: number) => {
+    const seen = calls.get(idx) ?? 0;
+    calls.set(idx, seen + 1);
+    return seen === 0 ? DEX_PAUSED : true;
+  };
+  const bytes = stream(
+    ...uleb(1),
+    ...uleb(1),
+    ...ulebp1(5), // parameter name
+    0x04, // START_LOCAL_EXTENDED v1 name 6, type 2, signature 7
+    ...uleb(1),
+    ...ulebp1(6),
+    ...ulebp1(2),
+    ...ulebp1(7),
+    EMIT_HERE,
+    SET_FILE,
+    ...ulebp1(6),
+    END_SEQUENCE,
+  );
+  const layout = {
+    firstRegister: 3,
+    registersSize: 4,
+    accessFlags: 0x8,
+    thisTypeIdx: 0,
+    paramTypes: dexParameterList([{ typeIdx: 1, wide: false }]),
+  };
+  const run = (extra: Partial<DexParameterLayout>) => {
+    const budget = dexWorkBudget(1_000);
+    const walk = startDebugInfo(
+      bytes,
+      1,
+      4,
+      { ...layout, ...extra },
+      {
+        budget,
+      },
+    );
+    if (!("resume" in walk)) throw new Error("expected a walk");
+    let pauses = 0;
+    let result = walk.resume();
+    while (result === DEX_PAUSED) {
+      pauses += 1;
+      result = walk.resume();
+    }
+    return { result, pauses, spent: budget.limit - budget.remaining };
+  };
+
+  it("re-reads the unit without re-checking or re-charging what already passed", () => {
+    const strings = new Map<number, number>();
+    const types = new Map<number, number>();
+    const paused = run({
+      stringValid: pausingOnce(strings),
+      typeValid: pausingOnce(types),
+    });
+    const whole = run({ stringValid: () => true, typeValid: () => true });
+    expect(paused.pauses).toBe(4);
+    expect(paused.result).toEqual(whole.result);
+    expect(paused.spent).toBe(whole.spent);
+    // Name 6 passed before type 2 paused, so the re-read skips it; SET_FILE
+    // checks it once more as its own reference.
+    expect(Object.fromEntries(strings)).toEqual({ 5: 2, 6: 3, 7: 2 });
+    expect(Object.fromEntries(types)).toEqual({ 2: 2 });
   });
 });

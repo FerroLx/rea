@@ -4,10 +4,16 @@ import { dexWorkBudget } from "./dexDebugInfo.js";
 import {
   assembleClassDetail,
   type DexWork,
+  type DexWorkError,
   summarizeDex,
 } from "./dexDebugMetadata.js";
 import { type DexFile, parseDexFile } from "./dexFile.js";
-import { debuggableDex, uleb } from "../../../tests/fixtures/dexFile.js";
+import type { Result } from "../result.js";
+import {
+  debuggableDex,
+  uleb,
+  ulebp1,
+} from "../../../tests/fixtures/dexFile.js";
 
 const work = (limit = 1_000_000, cancelled = false): DexWork => ({
   budget: dexWorkBudget(limit),
@@ -498,8 +504,8 @@ describe("dexDebugMetadata cooperative scheduling", () => {
         sliceUnits,
       });
       expect(result).toEqual({ ok: false, error: { kind: "cancelled" } });
-      // A slice overshoots by at most one pause-check interval (1,024 opcodes).
-      expect(longest).toBeLessThanOrEqual(sliceUnits + 1_024);
+      // The walk checks before every opcode, so a slice overshoots by one unit.
+      expect(longest).toBeLessThanOrEqual(sliceUnits + 1);
       expect(1_000_000 - budget.remaining).toBeLessThan(positions / 10);
     }
   });
@@ -516,6 +522,164 @@ describe("dexDebugMetadata cooperative scheduling", () => {
     );
     expect(result.ok && result.value.readiness).toBe("present");
     expect(yields).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * The fixture with `count` distinct `length`-byte ASCII strings appended as
+ * string ids 6.., and its method's debug stream replaced by the original
+ * header (line 10, parameter `x`), `events(ids)`, one position and the end.
+ */
+const withLongStrings = (
+  count: number,
+  length: number,
+  events: (ids: readonly number[]) => number[],
+): Uint8Array => {
+  const base = debuggableDex();
+  const { view: baseView, codeOff } = layoutOf(base);
+  const stringIdsOff = baseView.getUint32(60, true);
+  const stringsSize = baseView.getUint32(56, true);
+  const ids = Array.from({ length: count }, (_, i) => stringsSize + i);
+  const stringBytes = uleb(length).length + length + 1;
+  const idsOff = base.length + count * stringBytes;
+  const alignedIdsOff = idsOff + ((4 - (idsOff % 4)) % 4);
+  const stream = [
+    ...uleb(10),
+    ...uleb(1),
+    ...ulebp1(2),
+    ...events(ids),
+    0x0e,
+    0x00,
+  ];
+  const streamOff = alignedIdsOff + (stringsSize + count) * 4;
+  const bytes = new Uint8Array(streamOff + stream.length);
+  bytes.set(base);
+  const view = new DataView(bytes.buffer);
+  for (let i = 0; i < count; i += 1) {
+    const at = base.length + i * stringBytes;
+    const head = uleb(length);
+    bytes.set(head, at);
+    bytes.fill(0x61 + (i % 26), at + head.length, at + head.length + length);
+    view.setUint32(alignedIdsOff + (stringsSize + i) * 4, at, true);
+  }
+  bytes.set(
+    base.subarray(stringIdsOff, stringIdsOff + stringsSize * 4),
+    alignedIdsOff,
+  );
+  bytes.set(stream, streamOff);
+  view.setUint32(32, bytes.length, true); // file_size
+  view.setUint32(56, stringsSize + count, true); // string_ids_size
+  view.setUint32(60, alignedIdsOff, true); // string_ids_off
+  view.setUint32(codeOff + 8, streamOff, true); // debug_info_off
+  return bytes;
+};
+
+/** One DBG_SET_FILE per id. */
+const setFiles = (ids: readonly number[]): number[] =>
+  ids.flatMap((id) => [0x09, ...ulebp1(id)]);
+
+/**
+ * Run `run` with a small slice, recording the most work done between two
+ * yields; `abortAt` aborts at that yield.
+ */
+const pacedRun = async <T>(
+  run: (work: DexWork) => Promise<T>,
+  sliceUnits: number,
+  abortAt = Number.POSITIVE_INFINITY,
+) => {
+  const budget = dexWorkBudget(50_000_000);
+  const state = { aborted: false };
+  let mark = budget.remaining;
+  let longest = 0;
+  let yields = 0;
+  const result = await run({
+    budget,
+    cancelled: () => state.aborted,
+    yieldNow: () => {
+      longest = Math.max(longest, mark - budget.remaining);
+      mark = budget.remaining;
+      yields += 1;
+      if (yields === abortAt) state.aborted = true;
+      return Promise.resolve();
+    },
+    sliceUnits,
+  });
+  longest = Math.max(longest, mark - budget.remaining);
+  return { result, longest, spent: budget.limit - budget.remaining };
+};
+
+describe("dexDebugMetadata paces long string checks", () => {
+  const LENGTH = 100_000;
+  const SLICE = 1_000;
+  const runs = (
+    bytes: Uint8Array,
+  ): readonly ((work: DexWork) => Promise<Result<unknown, DexWorkError>>)[] => {
+    const parsed = parseDexFile(bytes);
+    if (!parsed.ok) throw new Error("fixture must frame");
+    return [
+      (work: DexWork) => summarizeDex(parsed.value, bytes, work),
+      (work: DexWork) => detailRun(parsed.value, bytes, work),
+    ];
+  };
+
+  it("pauses inside the name checks of one opcode run, so an abort lands mid-string", async () => {
+    // Eight SET_FILE events naming distinct long strings fit in far fewer
+    // opcodes than any opcode-count interval, but scanning them is ~1.6M units.
+    const bytes = withLongStrings(8, LENGTH, setFiles);
+    for (const run of runs(bytes)) {
+      const paced = await pacedRun(run, SLICE, 3);
+      expect(paced.result).toEqual({ ok: false, error: { kind: "cancelled" } });
+      expect(paced.longest).toBeLessThan(LENGTH / 4);
+      expect(paced.spent).toBeLessThan(LENGTH);
+    }
+  });
+
+  it("pauses while checking one long source-file name", async () => {
+    const bytes = withLongStrings(1, 4 * LENGTH, () => []);
+    const { classDefsOff, view } = layoutOf(bytes);
+    view.setUint32(classDefsOff + 16, 6, true); // source_file_idx -> long string
+    const paced = await pacedRun(runs(bytes)[0]!, SLICE);
+    expect(paced.result.ok).toBe(true);
+    expect(paced.longest).toBeLessThan(LENGTH);
+  });
+
+  it("pauses while checking one long class descriptor during a lookup", async () => {
+    const bytes = withLongStrings(1, 4 * LENGTH, () => []);
+    const { view } = layoutOf(bytes);
+    view.setUint32(view.getUint32(68, true), 6, true); // type 0 -> long string
+    const paced = await pacedRun(runs(bytes)[1]!, SLICE);
+    expect(paced.result).toEqual({ ok: true, value: null });
+    expect(paced.longest).toBeLessThan(LENGTH);
+  });
+
+  it("decodes the same result, charging each string once, however often it pauses", async () => {
+    const bytes = withLongStrings(7, LENGTH, (ids) => [
+      ...setFiles(ids.slice(0, 4)),
+      // START_LOCAL_EXTENDED v0 name/type/signature, then the names again.
+      0x04,
+      ...uleb(0),
+      ...ulebp1(ids[4]!),
+      ...ulebp1(1),
+      ...ulebp1(ids[5]!),
+      0x0e,
+      0x03,
+      ...uleb(0),
+      ...ulebp1(ids[6]!),
+      ...ulebp1(1),
+      ...setFiles(ids),
+    ]);
+    const longest: number[] = [];
+    for (const run of runs(bytes)) {
+      const whole = await pacedRun(run, 1 << 30);
+      const paced = await pacedRun(run, SLICE);
+      expect(paced.result).toEqual(whole.result);
+      expect(paced.result.ok).toBe(true);
+      expect(paced.spent).toBe(whole.spent);
+      longest.push(paced.longest);
+    }
+    // The summary only checks strings; the detail also decodes the names it
+    // reports, bounded by the output limit rather than paced.
+    expect(longest[0]).toBeLessThan(LENGTH / 4);
   });
 });
 

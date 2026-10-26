@@ -25,7 +25,7 @@ import {
 } from "./dexFile.js";
 import {
   absentMethodDebug,
-  DEX_DEBUG_PAUSED,
+  DEX_PAUSED,
   DexDebugInfoWalk,
   startDebugInfo,
   type DexDecodeOptions,
@@ -36,7 +36,7 @@ import {
   dexParameterWords,
 } from "./dexDebugInfo.js";
 import { type Result, err, ok } from "../result.js";
-import { DexStringResolver } from "./dexStrings.js";
+import { type DexPausable, DexStringResolver } from "./dexStrings.js";
 
 export type DexMethodState =
   | "present" // positions and locals both decoded
@@ -145,9 +145,14 @@ class DexPacer {
     this.#mark = work.budget.remaining;
   }
 
+  /** The budget's remaining work at or below which a slice is due. */
+  get threshold(): number {
+    return this.#mark - this.work.sliceUnits;
+  }
+
   /** A slice of work has been spent since the last pause. */
   get due(): boolean {
-    return this.#mark - this.work.budget.remaining >= this.work.sliceUnits;
+    return this.work.budget.remaining <= this.threshold;
   }
 
   async pause(): Promise<DexWorkError | null> {
@@ -156,30 +161,51 @@ class DexPacer {
     return outOfWork(this.work);
   }
 
-  /** {@link due} as a callback, for walks that pause from inside a stream. */
+  /** {@link due} as a callback, for string scans that pause mid-string. */
   readonly pauseDue = (): boolean => this.due;
+
+  /** {@link threshold} as a callback, for walks that pause from inside a stream. */
+  readonly pauseAt = (): number => this.threshold;
 }
 
 /**
- * Finish a method's decode. A stream that fits in the current slice finishes
- * synchronously; a longer one pauses between slices, so the host can yield and
- * deliver cancellation, and the result is a promise.
+ * Run a resumable step (a debug walk, or a string check) to its end. One that
+ * fits in the current slice finishes synchronously; a longer one pauses
+ * between slices, so the host can yield and deliver cancellation, and the
+ * result is a promise.
  */
+const settle = <T>(
+  step: () => DexPausable<T>,
+  pacer: DexPacer,
+): T | Promise<Result<T, DexWorkError>> => {
+  const first = step();
+  return first === DEX_PAUSED ? afterPause(step, pacer) : first;
+};
+
+/** Continue a step that paused: yield, then resume it until it settles. */
+const afterPause = async <T>(
+  step: () => DexPausable<T>,
+  pacer: DexPacer,
+): Promise<Result<T, DexWorkError>> => {
+  for (;;) {
+    const stop = await pacer.pause();
+    if (stop !== null) return err(stop);
+    const next = step();
+    if (next !== DEX_PAUSED) return ok(next);
+  }
+};
+
+/** Finish a method's decode, pausing inside a long stream. */
 const settleDecode = (
   decode: DexMethodDebug | DexDebugInfoWalk,
   pacer: DexPacer,
 ): DexMethodDebug | Promise<Result<DexMethodDebug, DexWorkError>> => {
   if (!(decode instanceof DexDebugInfoWalk)) return decode;
+  // The common case settles at once, without allocating a continuation.
   const first = decode.resume();
-  if (first !== DEX_DEBUG_PAUSED) return first;
-  return (async () => {
-    for (;;) {
-      const stop = await pacer.pause();
-      if (stop !== null) return err(stop);
-      const next = decode.resume();
-      if (next !== DEX_DEBUG_PAUSED) return ok(next);
-    }
-  })();
+  return first === DEX_PAUSED
+    ? afterPause(() => decode.resume(), pacer)
+    : first;
 };
 
 /** Apply `finish` to a settled decode, synchronously when it settled at once. */
@@ -277,8 +303,8 @@ const decodeMethodDebug = (
       accessFlags: method.accessFlags,
       thisTypeIdx: classTypeIdx,
       paramTypes,
-      stringValid: resolver.isValidReference,
-      typeValid: resolver.isValidTypeReference,
+      stringValid: resolver.referenceValidity,
+      typeValid: resolver.typeValidity,
     },
     options,
   );
@@ -403,9 +429,15 @@ const findClassDef = async (
     const stop = await visitClass(work, pacer);
     if (stop !== null) return err(stop);
     const def = readClassDef(bytes, dex.header, i);
-    const identity = resolver.typeIdentity(def.classIdx, wanted);
-    if (identity === "unreadable") unreadable += 1;
-    else if (identity === "match") {
+    // Awaited only when the descriptor's scan paused.
+    const checked = settle(
+      () => resolver.typeIdentity(def.classIdx, wanted),
+      pacer,
+    );
+    const identity = checked instanceof Promise ? await checked : ok(checked);
+    if (!identity.ok) return identity;
+    if (identity.value === "unreadable") unreadable += 1;
+    else if (identity.value === "match") {
       matches += 1;
       match ??= def;
     }
@@ -419,10 +451,12 @@ const findClassDef = async (
   return ok(match);
 };
 
+/** The member's string resolver, charging its budget and pausing with its pacer. */
 const resolverFor = (
   dex: DexFile,
   bytes: Uint8Array,
   work: DexWork,
+  pacer: DexPacer,
 ): DexStringResolver =>
   new DexStringResolver(
     bytes,
@@ -431,6 +465,7 @@ const resolverFor = (
       work.budget.remaining -= units;
     },
     () => work.budget.remaining <= 0,
+    pacer.pauseDue,
   );
 
 /**
@@ -448,8 +483,8 @@ export const assembleClassDetail = async (
   work: DexWork,
   outputLimit: number,
 ): Promise<Result<DexClassDetail | null, DexWorkError>> => {
-  const resolver = resolverFor(dex, bytes, work);
   const pacer = new DexPacer(work);
+  const resolver = resolverFor(dex, bytes, work, pacer);
   const found = await findClassDef(
     dex,
     bytes,
@@ -462,6 +497,15 @@ export const assembleClassDetail = async (
   if (!found.ok) return found;
   const classDef = found.value;
   if (classDef === undefined) return ok(null);
+  // The source file is scanned (paced) before its bound is read.
+  const sourceChecked = settle(
+    () => resolver.validity(classDef.sourceFileIdx),
+    pacer,
+  );
+  if (sourceChecked instanceof Promise) {
+    const paused = await sourceChecked;
+    if (!paused.ok) return paused;
+  }
   let projected =
     1024 +
     resolver.typeJsonBound(classDef.classIdx) +
@@ -501,7 +545,7 @@ export const assembleClassDetail = async (
           0,
           Math.floor((outputLimit - projected) / LOCAL_OVERHEAD),
         ),
-        pauseDue: pacer.pauseDue,
+        pauseAt: pacer.pauseAt,
       },
     );
     return afterDecode(settleDecode(decode, pacer), (debug) =>
@@ -613,8 +657,8 @@ export const summarizeDex = async (
   bytes: Uint8Array,
   work: DexWork,
 ): Promise<Result<DexSummary, DexWorkError>> => {
-  const resolver = resolverFor(dex, bytes, work);
   const pacer = new DexPacer(work);
+  const resolver = resolverFor(dex, bytes, work, pacer);
   const tallies = new Map<string, MethodTally>();
   let methodsWithCode = 0;
   let methodsWithDebugInfo = 0;
@@ -652,7 +696,10 @@ export const summarizeDex = async (
         // Validity is checked without decoding; only short names are
         // decoded into the bounded sample, so a multi-megabyte name is
         // counted but never materialised.
-        if (resolver.isValid(idx)) {
+        const checked = settle(() => resolver.validity(idx), pacer);
+        const valid = checked instanceof Promise ? await checked : ok(checked);
+        if (!valid.ok) return valid;
+        if (valid.value) {
           validSource[at]! |= bit;
           // A single distinct value signals -renamesourcefileattribute.
           distinctSources += 1;
@@ -719,7 +766,7 @@ export const summarizeDex = async (
         code,
         classDef.classIdx,
         resolver,
-        { budget: work.budget, collectLocals: false, pauseDue: pacer.pauseDue },
+        { budget: work.budget, collectLocals: false, pauseAt: pacer.pauseAt },
       );
       return afterDecode(settleDecode(decode, pacer), (debug) => {
         const spent = outOfWork(work);

@@ -103,7 +103,8 @@ but decoding continues to the end of the stream.
 Decoding is bounded by a per-member work budget and runs in slices: after
 each slice the reader yields to the event loop, so other MCP requests are
 served and a cancellation takes effect within one slice, not after the whole
-member. A single long debug stream also pauses between slices.
+member. A single long debug stream also pauses between slices, and so does
+checking one long string that a stream, class lookup or source file names.
 
 ## What the facts do and do not mean
 

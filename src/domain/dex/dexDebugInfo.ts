@@ -62,10 +62,12 @@ export interface DexParameterLayout {
    * pools. ART's verifier rejects a stream whose name, type, signature or
    * source-file reference falls outside them, and a file whose string data is
    * unreadable, so such a reference makes the stream malformed rather than
-   * counting as surviving debug evidence.
+   * counting as surviving debug evidence. A check may stop for a pause
+   * ({@link DEX_PAUSED}) partway through a long string; the walk then pauses
+   * and asks again for the same reference when resumed.
    */
-  readonly stringValid?: (idx: number) => boolean;
-  readonly typeValid?: (idx: number) => boolean;
+  readonly stringValid?: (idx: number) => boolean | typeof DEX_PAUSED;
+  readonly typeValid?: (idx: number) => boolean | typeof DEX_PAUSED;
 }
 
 /**
@@ -136,17 +138,22 @@ export interface DexDecodeOptions {
   readonly collectLocals?: boolean;
   readonly maxLocals?: number;
   /**
-   * Asked every {@link PAUSE_CHECK_INTERVAL} opcodes; `true` pauses the walk so
-   * the host can yield, and {@link DexDebugInfoWalk.resume} continues it.
+   * Read at each {@link DexDebugInfoWalk.resume}: the `budget.remaining` at or
+   * below which the host's work slice is due. Before each parameter name and
+   * opcode (after the first of a resume) the walk pauses once its budget has
+   * reached it, so the host can yield, and `resume` continues. Reference
+   * checks pause on their own inside a long string
+   * ({@link DexParameterLayout.stringValid}).
    */
-  readonly pauseDue?: () => boolean;
+  readonly pauseAt?: () => number;
 }
 
-/** Opcodes walked between {@link DexDecodeOptions.pauseDue} checks. */
-const PAUSE_CHECK_INTERVAL = 1024;
-
-/** {@link DexDebugInfoWalk.resume} stopped for a pause, not at the stream's end. */
-export const DEX_DEBUG_PAUSED = Symbol("dex-debug-paused");
+/**
+ * A resumable step stopped for a pause, not at its end: the debug walk
+ * ({@link DexDebugInfoWalk.resume}) or a string check partway through a long
+ * string. Calling it again continues where it stopped.
+ */
+export const DEX_PAUSED = Symbol("dex-paused");
 
 /** A method with no `debug_info_item` (debug_info_off == 0). */
 export const absentMethodDebug = (): DexMethodDebug => ({
@@ -181,8 +188,12 @@ interface LiveLocal {
  */
 export const DEX_MAX_PARAMETERS = 255;
 
-/** `true` keeps the walk going; `false` records a fault and stops it. */
-type Step = boolean;
+/**
+ * `true` keeps the walk going; `false` records a fault and stops it;
+ * {@link DEX_PAUSED} means a reference check paused, so the unit is re-read
+ * from its start on resume.
+ */
+type Step = boolean | typeof DEX_PAUSED;
 
 /**
  * Work units (debug opcodes, parameter-name reads, class_data entries) a caller
@@ -228,11 +239,20 @@ export class DexDebugInfoWalk {
   private explicitLocalCount = 0;
   private localLimitExceeded = false;
   private started = false;
+  /** Parameter names the header declares; read one unit at a time. */
+  private paramsSize = 0;
+  private seeded = false;
+  /** Start of the unit (parameter name or opcode) being read. */
+  private unitStart = 0;
+  /** The unit at {@link unitStart} paused in a reference check: re-read it. */
+  private retrying = false;
+  /** References of the current unit already found valid (skipped on a re-read). */
+  private referencesPassed = 0;
+  private referencesSeen = 0;
   /** The decoded result once the walk has ended; later resumes return it. */
   private finished: DexMethodDebug | undefined;
-  private sincePauseCheck = 0;
   private readonly budget: DexWorkBudget | undefined;
-  private readonly pauseDue: (() => boolean) | undefined;
+  private readonly pauseAt: (() => number) | undefined;
   private readonly collectLocals: boolean;
   private readonly maxLocals: number;
 
@@ -245,29 +265,73 @@ export class DexDebugInfoWalk {
   ) {
     this.cursor = new DexCursor(bytes, offset);
     this.budget = options.budget;
-    this.pauseDue = options.pauseDue;
+    this.pauseAt = options.pauseAt;
     this.collectLocals = options.collectLocals ?? true;
     this.maxLocals = options.maxLocals ?? Number.POSITIVE_INFINITY;
   }
 
-  /** Charge one unit of the member's work; false once the budget is spent. */
-  private charge(): boolean {
-    if (this.budget === undefined) return true;
-    if (this.budget.remaining <= 0) return false;
-    this.budget.remaining -= 1;
-    return true;
+  /**
+   * A reference (`-1` = none) naming a readable string or type. One already
+   * found valid before the unit paused is not checked again on its re-read.
+   */
+  private reference(
+    idx: number,
+    valid: ((idx: number) => boolean | typeof DEX_PAUSED) | undefined,
+  ): Step {
+    this.referencesSeen += 1;
+    if (this.referencesSeen <= this.referencesPassed) return true;
+    const checked = idx === -1 || valid === undefined || valid(idx);
+    if (checked === true) this.referencesPassed = this.referencesSeen;
+    return checked;
   }
 
-  /** A string reference (`-1` = none) naming a readable string. */
-  private stringRef(idx: number): boolean {
-    const valid = this.layout?.stringValid;
-    return idx === -1 || valid === undefined || valid(idx);
+  private stringRef(idx: number): Step {
+    return this.reference(idx, this.layout?.stringValid);
   }
 
-  /** A type reference (`-1` = none) naming a type with a readable descriptor. */
-  private typeRef(idx: number): boolean {
-    const valid = this.layout?.typeValid;
-    return idx === -1 || valid === undefined || valid(idx);
+  private typeRef(idx: number): Step {
+    return this.reference(idx, this.layout?.typeValid);
+  }
+
+  /**
+   * Begin the next unit (a parameter name or an opcode): pause first when the
+   * budget has reached `pauseAt` (never before the first unit of a resume, so
+   * every resume progresses), then charge it. A unit re-read after a paused
+   * reference check was charged already.
+   */
+  private begin(pauseAt: number): "go" | "pause" | "spent" {
+    if (this.retrying) {
+      this.cursor.offset = this.unitStart;
+      return "go";
+    }
+    const budget = this.budget;
+    if (budget !== undefined) {
+      if (budget.remaining <= pauseAt) return "pause";
+      if (budget.remaining <= 0) return "spent";
+      budget.remaining -= 1;
+    }
+    return "go";
+  }
+
+  /**
+   * Enter a unit that checks references, starting at `start`. Only such units
+   * can pause mid-way, so only they record where a re-read starts; a re-read
+   * keeps the references that already passed.
+   */
+  private enter(start: number): void {
+    this.referencesSeen = 0;
+    if (this.retrying) {
+      this.retrying = false;
+      return;
+    }
+    this.unitStart = start;
+    this.referencesPassed = 0;
+  }
+
+  /** The current unit paused in a reference check; re-read it on resume. */
+  private interrupted(): typeof DEX_PAUSED {
+    this.retrying = true;
+    return DEX_PAUSED;
   }
 
   /** Seed the implicit parameter locals (and `this`) live at address 0. */
@@ -329,7 +393,7 @@ export class DexDebugInfoWalk {
     });
   }
 
-  private header(): Step {
+  private header(): boolean {
     const lineStart = this.cursor.uleb128();
     if (!lineStart.ok) return false;
     this.line = lineStart.value;
@@ -345,17 +409,22 @@ export class DexDebugInfoWalk {
       paramsSize.value !== declared.typeIdx.length
     )
       return false;
-    for (let i = 0; i < paramsSize.value; i += 1) {
-      if (!this.charge()) return false;
-      const nameIdx = this.cursor.uleb128p1();
-      if (!nameIdx.ok || !this.stringRef(nameIdx.value)) return false;
-      this.parameterNames.push(nameIdx.value);
-    }
-    this.seedParameters();
+    this.paramsSize = paramsSize.value;
+    return true;
+  }
+
+  private parameterName(): Step {
+    this.enter(this.cursor.offset);
+    const nameIdx = this.cursor.uleb128p1();
+    if (!nameIdx.ok) return false;
+    const valid = this.stringRef(nameIdx.value);
+    if (valid !== true) return valid;
+    this.parameterNames.push(nameIdx.value);
     return true;
   }
 
   private startLocal(extended: boolean): Step {
+    this.enter(this.cursor.offset - 1); // from its opcode byte
     const reg = this.cursor.uleb128();
     const nameIdx = this.cursor.uleb128p1();
     const typeIdx = this.cursor.uleb128p1();
@@ -366,12 +435,12 @@ export class DexDebugInfoWalk {
       signatureIdx = sig.value;
     }
     if (!reg.ok || !nameIdx.ok || !typeIdx.ok) return false;
-    if (
-      !this.stringRef(nameIdx.value) ||
-      !this.typeRef(typeIdx.value) ||
-      !this.stringRef(signatureIdx)
-    )
-      return false;
+    const name = this.stringRef(nameIdx.value);
+    if (name !== true) return name;
+    const type = this.typeRef(typeIdx.value);
+    if (type !== true) return type;
+    const signature = this.stringRef(signatureIdx);
+    if (signature !== true) return signature;
     // A register past the method's frame is malformed; refusing it also caps
     // the live-register maps at registers_size (<= 65,535).
     if (!this.inFrame(reg.value)) return false;
@@ -428,8 +497,11 @@ export class DexDebugInfoWalk {
   }
 
   private setFile(): Step {
+    this.enter(this.cursor.offset - 1); // from its opcode byte
     const nameIdx = this.cursor.uleb128p1();
-    if (!nameIdx.ok || !this.stringRef(nameIdx.value)) return false;
+    if (!nameIdx.ok) return false;
+    const valid = this.stringRef(nameIdx.value);
+    if (valid !== true) return valid;
     this.setFileEvents += 1;
     return true;
   }
@@ -447,7 +519,7 @@ export class DexDebugInfoWalk {
     this.positionCount += 1;
   }
 
-  /** Dispatch one non-terminal opcode; returns false to stop on a fault. */
+  /** Dispatch one non-terminal opcode; `false` stops the walk on a fault. */
   private dispatch(op: number): Step {
     if (op === DBG_ADVANCE_PC) {
       const d = this.cursor.uleb128();
@@ -507,30 +579,47 @@ export class DexDebugInfoWalk {
 
   /**
    * Walk until the stream ends (the decoded result) or a pause is due
-   * ({@link DEX_DEBUG_PAUSED}); call again after the host has yielded.
+   * ({@link DEX_PAUSED}); call again after the host has yielded. Pausing
+   * never changes the result: a unit interrupted by a reference check is
+   * re-read from its start without being charged again.
    */
-  resume(): DexMethodDebug | typeof DEX_DEBUG_PAUSED {
+  resume(): DexMethodDebug | typeof DEX_PAUSED {
     if (this.finished !== undefined) return this.finished;
     if (!this.started) {
       this.started = true;
       if (!this.header()) return this.finish(false);
     }
+    // The slice's threshold, fixed while this resume runs; the first unit
+    // never pauses, so every resume progresses.
+    const threshold = this.pauseAt?.() ?? Number.NEGATIVE_INFINITY;
+    let pauseAt = Number.NEGATIVE_INFINITY;
+    // Out of the member's work: stop; the caller sees remaining <= 0 and refuses.
+    while (this.parameterNames.length < this.paramsSize) {
+      const begun = this.begin(pauseAt);
+      pauseAt = threshold;
+      if (begun === "pause") return DEX_PAUSED;
+      if (begun === "spent") return this.finish(false);
+      const step = this.parameterName();
+      if (step === DEX_PAUSED) return this.interrupted();
+      if (!step) return this.finish(false);
+    }
+    if (!this.seeded) {
+      this.seeded = true;
+      this.seedParameters();
+    }
     // Every opcode consumes at least one byte, so the stream's own bytes bound
     // the loop; the member's work budget bounds its cost.
     for (;;) {
-      if (this.pauseDue !== undefined) {
-        this.sincePauseCheck += 1;
-        if (this.sincePauseCheck >= PAUSE_CHECK_INTERVAL) {
-          this.sincePauseCheck = 0;
-          if (this.pauseDue()) return DEX_DEBUG_PAUSED;
-        }
-      }
-      // Out of the member's work: stop; the caller sees remaining <= 0 and refuses.
-      if (!this.charge() || this.localLimitExceeded) break;
+      const begun = this.begin(pauseAt);
+      pauseAt = threshold;
+      if (begun === "pause") return DEX_PAUSED;
+      if (begun === "spent" || this.localLimitExceeded) break;
       const op = this.cursor.u1();
       if (!op.ok) break;
       if (op.value === DBG_END_SEQUENCE) return this.finish(true);
-      if (!this.dispatch(op.value)) break;
+      const step = this.dispatch(op.value);
+      if (step === DEX_PAUSED) return this.interrupted();
+      if (!step) break;
     }
     // Ran off the end without DBG_END_SEQUENCE, or a fault above.
     return this.finish(false);
