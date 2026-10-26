@@ -159,17 +159,23 @@ HotSpot's type-checking verifier, final from class version 51, rejects a
 length, falls inside an instruction rather than at its first byte ("Illegal
 local variable table start_pc" / "length"). A `wide` prefix and the opcode it
 modifies are one instruction, and `tableswitch`/`lookupswitch` padding is
-aligned from the start of the code array. A `LocalVariableTypeTable` row is
-judged by the same rule, because HotSpot rejects the class either way: its
-matching `LocalVariableTable` row is misaligned too, or no row matches it. A
-version 50 class that fails this check is re-verified by the older verifier,
+aligned from the start of the code array. A `LocalVariableTypeTable` row inside
+an instruction is rejected only when the method has at least one
+`LocalVariableTable` row (across all its occurrences): HotSpot then merges the
+type table into it, and the row's misaligned twin, or its lack of any matching
+row, rejects the class. With no `LocalVariableTable` row the type table is
+never merged or verified, so HotSpot loads the class; the row still reports
+`scope: "misaligned"` but its table stays `present`. A type-table scope outside
+the code is rejected either way. A version 50 class that fails this check is re-verified by the older verifier,
 which loads it, so below version 51 scopes are only checked against the code
 length (`in-code`). Line-number positions have no boundary rule: HotSpot
 accepts a `start_pc` inside an instruction. REA decodes each method's
 instruction lengths once, only when a local scope needs them; an instruction
 stream that does not decode (an illegal opcode, an instruction past the code's
-end, `wide` before an opcode it cannot modify, or a switch with `high < low` or
-a negative pair count), which HotSpot's verifier also rejects, leaves every
+end, `wide` before an opcode it cannot modify, a switch with `high < low` or a
+negative pair count, a switch whose fixed operands reach the code's end, or,
+from class version 51, `jsr`, `jsr_w`, `ret` or `wide ret`), which HotSpot's
+verifier also rejects, leaves every
 in-code scope `unknown` and its table `malformed`, never `present`. Like every
 check on this page, this follows a JVM that verifies the class, as it does by
 default for classes outside the boot class path.

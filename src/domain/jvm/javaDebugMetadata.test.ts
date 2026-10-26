@@ -757,9 +757,9 @@ describe("decodeClassDebugMetadata — local scopes and instruction boundaries",
     expect(method.state).toBe("present");
   });
 
-  it("judges a type-table scope by the same rule from version 51", () => {
-    // Its LocalVariableTable twin is misaligned, or no twin matches it: HotSpot
-    // rejects the class either way.
+  it("rejects a misaligned type-table row when the method has local-variable rows", () => {
+    // HotSpot merges the type table into a non-empty LocalVariableTable, so a
+    // misaligned row is rejected: through its misaligned twin or as unmatched.
     const method = decodeFixture(
       jvmDebugClass({
         code: BIPUSH_POP_RETURN,
@@ -770,6 +770,53 @@ describe("decodeClassDebugMetadata — local scopes and instruction boundaries",
     expect(method.localVariableTypes.entries[0]!.scope).toBe("misaligned");
     expect(method.localVariableTypes.presence).toBe("malformed");
     expect(method.state).toBe("malformed");
+  });
+
+  // OpenJDK 21/25 load and verify these: with no LocalVariableTable row the
+  // type table is never merged, so the verifier never sees its scopes.
+  it.each([
+    ["absent", null],
+    ["present with no rows", []],
+  ] as const)(
+    "keeps a misaligned type-table row valid when the LocalVariableTable is %s",
+    (_label, locals) => {
+      const method = decodeFixture(
+        jvmDebugClass({
+          code: BIPUSH_POP_RETURN,
+          locals,
+          typedLocals: [{ slot: 0, descriptor: "I", startPc: 1, length: 3 }],
+        }),
+      );
+      expect(method.localVariableTypes.entries[0]!.scope).toBe("misaligned");
+      expect(method.localVariableTypes.presence).toBe("present");
+      expect(method.state).not.toBe("malformed");
+    },
+  );
+
+  it("still rejects an out-of-range type-table row without LocalVariableTable rows", () => {
+    // HotSpot's parser: "Invalid start_pc 87 in LocalVariableTypeTable".
+    const method = decodeFixture(
+      jvmDebugClass({
+        code: BIPUSH_POP_RETURN,
+        locals: null,
+        typedLocals: [{ slot: 0, descriptor: "I", startPc: 87, length: 1 }],
+      }),
+    );
+    expect(method.localVariableTypes.entries[0]!.scope).toBe("out-of-range");
+    expect(method.state).toBe("malformed");
+  });
+
+  it("treats subroutine instructions as undecodable from version 51", () => {
+    // jsr +4; return; astore_1; ret 1: HotSpot "Bad instruction: a8" at 51+.
+    const code = [0xa8, 0, 4, 0xb1, 0x4c, 0xa9, 1];
+    const at = (majorVersion: number) =>
+      decodeFixture(
+        jvmDebugClass({ majorVersion, code, locals: [local(0, code.length)] }),
+      );
+    expect(at(52).localVariables.entries[0]!.scope).toBe("unknown");
+    expect(at(52).state).toBe("malformed");
+    expect(at(50).localVariables.entries[0]!.scope).toBe("in-code");
+    expect(at(50).state).toBe("present");
   });
 
   // Version 50 fails over to the inference verifier, which does not check

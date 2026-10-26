@@ -239,6 +239,70 @@ cliTest(
 );
 
 cliTest(
+  "judges type-table scopes and subroutines as HotSpot verifies them over CLI and MCP",
+  async ({ cli }) => {
+    const root = await createTestTempDirectory("rea-jvm-type-scopes-");
+    const { client, call } = await connectLocalToolsMcp();
+    const bipushPopReturn = [0x10, 0x05, 0x57, 0xb1];
+    const typed = [
+      { slot: 0, descriptor: "I", startPc: 1, length: 3 },
+    ] as const;
+    // OpenJDK 21/25 load and verify a misaligned LocalVariableTypeTable row
+    // when the method has no LocalVariableTable row: the type table is only
+    // merged into, and verified with, a non-empty LocalVariableTable.
+    const cases = [
+      {
+        name: "type-only",
+        options: { code: bipushPopReturn, locals: null, typedLocals: typed },
+        state: "partial",
+        lvtt: "present",
+        scope: "misaligned",
+      },
+      {
+        name: "type-with-empty-locals",
+        options: { code: bipushPopReturn, locals: [], typedLocals: typed },
+        state: "present",
+        lvtt: "present",
+        scope: "misaligned",
+      },
+      // jsr +4; return; astore_1; ret 1 at version 52: "Bad instruction: a8".
+      {
+        name: "subroutine",
+        options: {
+          code: [0xa8, 0, 4, 0xb1, 0x4c, 0xa9, 1],
+          locals: null,
+          typedLocals: [{ slot: 0, descriptor: "I", startPc: 0, length: 7 }],
+        },
+        state: "malformed",
+        lvtt: "malformed",
+        scope: "unknown",
+      },
+    ] as const;
+    for (const { name, options, state, lvtt, scope } of cases) {
+      const path = join(root, `${name}.class`);
+      await writeFile(path, jvmDebugClass(options));
+      const outcome = await inspectBoth(cli, call, { path });
+      if (!outcome.ok) throw new Error(JSON.stringify(outcome.error));
+      expect(outcome.evidence).toMatchObject({
+        normalized_result: {
+          methods: [
+            {
+              state,
+              local_variable_type_table: {
+                presence: lvtt,
+                entries: [{ scope }],
+              },
+            },
+          ],
+        },
+      });
+    }
+    await client.ping();
+  },
+  30000,
+);
+
+cliTest(
   "names unflagged JAR members as the JDK does (UTF-8) over CLI and MCP",
   async ({ cli }) => {
     const root = await createTestTempDirectory("rea-jvm-names-");

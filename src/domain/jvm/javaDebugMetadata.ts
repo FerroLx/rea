@@ -264,10 +264,9 @@ type ScopeClassifier = (startPc: number, length: number) => LocalScope;
  * scope outside the code ("Invalid start_pc" / "Invalid length"); from class
  * version 51 its verifier also rejects one whose start, or whose end short of
  * `code_length`, is not an instruction start ("Illegal local variable table
- * start_pc" / "length"), for `LocalVariableTable` rows directly and for
- * `LocalVariableTypeTable` rows through the row each must match. The code is
- * decoded at most once, on the first in-range scope, and never for a class
- * below version 51 or a method without one.
+ * start_pc" / "length"). The code is decoded at most once, on the first
+ * in-range scope, and never for a class below version 51 or a method without
+ * one. Which tables a misaligned scope invalidates is decided by each table.
  */
 const scopeClassifier = (
   code: Uint8Array,
@@ -279,7 +278,7 @@ const scopeClassifier = (
     const end = startPc + length;
     if (startPc >= code.length || end > code.length) return "out-of-range";
     if (!checksBoundaries) return "in-code";
-    boundaries ??= decodeInstructionBoundaries(code);
+    boundaries ??= decodeInstructionBoundaries(code, majorVersion);
     if (!boundaries.ok) return "unknown";
     return boundaries.value.startsAt(startPc) &&
       (end === code.length || boundaries.value.startsAt(end))
@@ -291,6 +290,24 @@ const scopeClassifier = (
 /** Only a scope known to lie on the code's instructions, or in it below 51, is valid. */
 const scopeValid = (scope: LocalScope): boolean =>
   scope === "aligned" || scope === "in-code";
+
+/**
+ * HotSpot checks a `LocalVariableTypeTable` row against instruction
+ * boundaries only through the `LocalVariableTable`: it merges the type table
+ * into the method's local-variable table only when that table has at least
+ * one row (counting every occurrence), and the verifier walks the merged
+ * table. With a row, a misaligned type-table row is rejected either way (its
+ * matching row is misaligned too, or no row matches it). With none, it is
+ * loaded and verified (OpenJDK 21 and 25), so its `misaligned` scope is kept
+ * but does not make the table invalid. A scope outside the code is always
+ * rejected by the class-file parser, and an undecodable stream by the
+ * verifier, whatever the other table holds.
+ */
+const typeScopeValid = (
+  scope: LocalScope,
+  localVariableRows: number,
+): boolean =>
+  scopeValid(scope) || (scope === "misaligned" && localVariableRows === 0);
 
 const decodeLocalVariableTable = (
   infos: readonly Uint8Array[],
@@ -358,6 +375,7 @@ const decodeLocalVariableTypeTable = (
   scopeOf: ScopeClassifier,
   maxLocals: number,
   majorVersion: number,
+  localVariableRows: number,
 ): DebugTable<LocalVariableTypeEntry> =>
   decodeTable(
     infos,
@@ -384,7 +402,7 @@ const decodeLocalVariableTypeTable = (
     (entry) =>
       legalLocalName(entry.name, majorVersion) &&
       entry.signature !== null &&
-      scopeValid(entry.scope) &&
+      typeScopeValid(entry.scope, localVariableRows) &&
       slotInFrame(entry.slot, maxLocals),
   );
 
@@ -549,6 +567,8 @@ export const decodeMethodDebugMetadata = (
       scopeOf,
       maxLocals,
       majorVersion,
+      // HotSpot's total_lvt_length: the declared rows of every occurrence.
+      localVariables.declaredCount,
     ),
   );
 

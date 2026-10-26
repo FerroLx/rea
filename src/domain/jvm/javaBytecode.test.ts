@@ -2,14 +2,20 @@ import { describe, expect, it } from "vitest";
 
 import { decodeInstructionBoundaries } from "./javaBytecode.js";
 
-const starts = (code: readonly number[]): number[] => {
-  const decoded = decodeInstructionBoundaries(Uint8Array.from(code));
+const starts = (code: readonly number[], majorVersion = 52): number[] => {
+  const decoded = decodeInstructionBoundaries(
+    Uint8Array.from(code),
+    majorVersion,
+  );
   if (!decoded.ok) throw new Error(JSON.stringify(decoded.error));
   return code.flatMap((_, pc) => (decoded.value.startsAt(pc) ? [pc] : []));
 };
 
-const failure = (code: readonly number[]) => {
-  const decoded = decodeInstructionBoundaries(Uint8Array.from(code));
+const failure = (code: readonly number[], majorVersion = 52) => {
+  const decoded = decodeInstructionBoundaries(
+    Uint8Array.from(code),
+    majorVersion,
+  );
   if (decoded.ok) throw new Error("expected the stream not to decode");
   return decoded.error;
 };
@@ -36,10 +42,10 @@ describe("decodeInstructionBoundaries", () => {
   });
 
   it("treats wide and the opcode it modifies as one instruction", () => {
-    // wide iinc 14, 1000 (6); wide iload 300 (4); wide ret 2 (4); return.
+    // wide iinc 14, 1000 (6); wide iload 300 (4); wide astore 2 (4); return.
     expect(
       starts([
-        0xc4, 0x84, 0, 14, 0x03, 0xe8, 0xc4, 0x15, 0x01, 0x2c, 0xc4, 0xa9, 0, 2,
+        0xc4, 0x84, 0, 14, 0x03, 0xe8, 0xc4, 0x15, 0x01, 0x2c, 0xc4, 0x3a, 0, 2,
         0xb1,
       ]),
     ).toEqual([0, 6, 10, 14]);
@@ -110,13 +116,48 @@ describe("decodeInstructionBoundaries", () => {
   });
 
   it("refuses a tableswitch with high < low and a negative lookupswitch count", () => {
-    expect(failure([0xaa, 0, 0, 0, ...s4(0), ...s4(5), ...s4(1)])).toEqual({
+    expect(
+      failure([0xaa, 0, 0, 0, ...s4(0), ...s4(5), ...s4(1), 0xb1]),
+    ).toEqual({
       kind: "invalid-switch",
       pc: 0,
     });
-    expect(failure([0xab, 0, 0, 0, ...s4(0), ...s4(-1)])).toEqual({
+    expect(failure([0xab, 0, 0, 0, ...s4(0), ...s4(-1), 0xb1])).toEqual({
       kind: "invalid-switch",
       pc: 0,
+    });
+  });
+
+  it("refuses a lookupswitch whose fixed operands end at code_length, as HotSpot does", () => {
+    // iconst_0; lookupswitch default 0, npairs 0: twelve bytes, all of the code.
+    expect(failure([0x03, 0xab, 0, 0, ...s4(0), ...s4(0)])).toEqual({
+      kind: "truncated-instruction",
+      pc: 1,
+    });
+    // The same switch followed by an instruction decodes.
+    expect(starts([0x03, 0xab, 0, 0, ...s4(0), ...s4(0), 0xb1])).toEqual([
+      0, 1, 12,
+    ]);
+  });
+
+  it("decodes subroutine instructions below version 51 and refuses them from 51", () => {
+    // jsr +4; return; astore_1; ret 1 (javac 1.4 style finally).
+    const subroutine = [0xa8, 0, 4, 0xb1, 0x4c, 0xa9, 1];
+    expect(starts(subroutine, 50)).toEqual([0, 3, 4, 5]);
+    expect(failure(subroutine, 51)).toEqual({
+      kind: "subroutine-instruction",
+      pc: 0,
+      opcode: 0xa8,
+    });
+    expect(failure([0xb1, 0xc4, 0xa9, 0, 1], 52)).toEqual({
+      kind: "subroutine-instruction",
+      pc: 1,
+      opcode: 0xc4,
+    });
+    expect(failure([0xc9, 0, 0, 0, 5, 0xb1], 69)).toEqual({
+      kind: "subroutine-instruction",
+      pc: 0,
+      opcode: 0xc9,
     });
   });
 });

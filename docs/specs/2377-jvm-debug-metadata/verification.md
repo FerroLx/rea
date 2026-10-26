@@ -237,8 +237,10 @@ patched `javac` classes through a `URLClassLoader`) and fixed:
   its instruction and switch padding is aligned from the code start. Version 49
   and 50 classes load (50 fails over to the old verifier), and so does a class
   loaded without verification. A `LocalVariableTypeTable` row inside an
-  instruction is rejected too, either through its misaligned twin or as
-  matching no row. Line-number `start_pc` values have no boundary rule. Local
+  instruction is rejected only when the method has at least one
+  `LocalVariableTable` row (through its misaligned twin or as matching no row);
+  HotSpot merges and verifies the type table only in that case, so with none
+  the class loads. Line-number `start_pc` values have no boundary rule. Local
   entries now carry `scope` (`aligned`, `in-code`, `misaligned`,
   `out-of-range`, `unknown`) in place of `out_of_range`; an undecodable
   instruction stream (each tested form gives `VerifyError: Bad instruction`

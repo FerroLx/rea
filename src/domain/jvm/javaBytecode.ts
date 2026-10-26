@@ -8,7 +8,9 @@
  * version 51; a version 50 class that fails it is re-verified by the old
  * inference verifier, which does not check scopes, so the rule binds only from
  * version 51. This module owns that decoding; it reads instruction lengths
- * only and never interprets operands beyond what a length needs.
+ * only and never interprets operands beyond what a length needs. Where HotSpot
+ * cannot decode the stream it rejects the method ("Bad instruction"), so such
+ * a stream has no boundaries here either.
  */
 import { err, ok, type Result } from "../result.js";
 
@@ -37,6 +39,16 @@ export type BytecodeDecodeError =
       /** A `tableswitch` with `high < low`, or a `lookupswitch` with `npairs < 0`. */
       readonly kind: "invalid-switch";
       readonly pc: number;
+    }
+  | {
+      /**
+       * `jsr`, `jsr_w`, `ret` or `wide ret` in a class of version 51 or later,
+       * where the type-checking verifier has no rule for them (OpenJDK 21/25:
+       * "Bad instruction" / "Bad wide instruction").
+       */
+      readonly kind: "subroutine-instruction";
+      readonly pc: number;
+      readonly opcode: number;
     };
 
 /** The instruction starts of one decoded `code` array. */
@@ -45,6 +57,9 @@ export interface InstructionBoundaries {
   readonly startsAt: (pc: number) => boolean;
 }
 
+const JSR = 0xa8;
+const RET = 0xa9;
+const JSR_W = 0xc9;
 const TABLESWITCH = 0xaa;
 const LOOKUPSWITCH = 0xab;
 const WIDE = 0xc4;
@@ -116,7 +131,11 @@ const variableLength = (
   }
   const operands = pc + 1 + ((4 - ((pc + 1) % 4)) % 4);
   const fixedOperands = opcode === TABLESWITCH ? 12 : 8;
-  if (operands + fixedOperands > code.length)
+  // HotSpot (`Bytecodes::special_length_at`) refuses a switch whose fixed
+  // operands reach `code_length`, even one that would end exactly there (a
+  // lookupswitch with no pairs); a well-formed tableswitch always has jump
+  // offsets after them.
+  if (operands + fixedOperands >= code.length)
     return err({ kind: "truncated-instruction", pc });
   if (opcode === TABLESWITCH) {
     const low = s4(code, operands + 4);
@@ -135,16 +154,26 @@ const variableLength = (
  * method), so decoding every method of a class is bounded by the class-file
  * input budget. A stream that does not decode into whole instructions is an
  * error: its boundaries, and so any scope check against them, are unknown.
+ * From `majorVersion` 51 the subroutine instructions are such an error too.
  */
 export const decodeInstructionBoundaries = (
   code: Uint8Array,
+  majorVersion: number,
 ): Result<InstructionBoundaries, BytecodeDecodeError> => {
+  const noSubroutines = majorVersion >= SPLIT_VERIFIER_MAJOR_VERSION;
   const starts = new Uint8Array(code.length);
   let pc = 0;
   while (pc < code.length) {
     const opcode = code[pc]!;
     const fixed = FIXED_LENGTHS[opcode];
     if (fixed === undefined) return err({ kind: "illegal-opcode", pc, opcode });
+    const subroutine =
+      opcode === JSR ||
+      opcode === RET ||
+      opcode === JSR_W ||
+      (opcode === WIDE && code[pc + 1] === RET);
+    if (noSubroutines && subroutine)
+      return err({ kind: "subroutine-instruction", pc, opcode });
     let length = fixed;
     if (length === 0) {
       const measured = variableLength(code, pc, opcode);

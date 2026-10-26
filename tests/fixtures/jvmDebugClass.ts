@@ -20,7 +20,8 @@ export interface JvmFixtureLocal {
 export const jvmDebugClass = (
   options: {
     readonly maxLocals?: number;
-    readonly locals?: readonly JvmFixtureLocal[];
+    /** `null` omits the LocalVariableTable attribute. */
+    readonly locals?: readonly JvmFixtureLocal[] | null;
     readonly typedLocals?: readonly JvmFixtureLocal[];
     readonly linePc?: number;
     readonly trailingBytes?: number;
@@ -127,7 +128,9 @@ export const jvmDebugClass = (
     linePc & 0xff,
     0,
     1,
-    ...table(5, options.locals ?? [{ slot: 0, descriptor: "J" }]),
+    ...(options.locals === null
+      ? []
+      : table(5, options.locals ?? [{ slot: 0, descriptor: "J" }])),
     ...(options.typedLocals === undefined
       ? []
       : table(11, options.typedLocals)),
@@ -146,7 +149,9 @@ export const jvmDebugClass = (
     0,
     0, // exception_table_length
     0,
-    options.typedLocals === undefined ? 2 : 3,
+    1 +
+      (options.locals === null ? 0 : 1) +
+      (options.typedLocals === undefined ? 0 : 1),
     ...subAttributes,
   ];
   u2(3);

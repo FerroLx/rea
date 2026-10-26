@@ -292,7 +292,8 @@ compiler-emitted `SourceFile`, `LineNumberTable`, `LocalVariableTable` and
 offsets, local slots and scope ranges to the method's name and descriptor. Each
 local scope reports where it lies in the code; from class version 51 one
 starting or ending inside an instruction is `misaligned` and its table
-`malformed`, as HotSpot rejects it. A JAR is read as `JarFile` reads it: one
+`malformed`, as HotSpot rejects it (a type-table row only when the method has
+local-variable rows). A JAR is read as `JarFile` reads it: one
 holding any encrypted record is refused, only the manifest and the selected
 class count against the decompression budget, and a `META-INF/` entry is never
 versioned. No
