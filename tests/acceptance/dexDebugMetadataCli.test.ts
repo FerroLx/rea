@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import { expect } from "vitest";
 
-import { toolContract } from "../../src/contracts/toolContracts.js";
+import { INSPECT_DEX_DEBUG_METADATA_CONTRACT } from "../../src/contracts/dex/dexToolContracts.js";
 import { DEX_LIMITS } from "../../src/dex/DexFileRelease.js";
 import { refusalMark } from "../../src/dex/dexDisplayText.js";
 import {
@@ -15,11 +15,11 @@ import { connectLocalToolsMcp } from "../fixtures/localToolsMcp.js";
 import { createTestTempDirectory } from "../fixtures/temporaryDirectory.js";
 import { cliTest, type TestCli } from "../support/cli/cliFixture.js";
 
-const TOOL = "inspect_dex_debug_metadata";
+const TOOL = INSPECT_DEX_DEBUG_METADATA_CONTRACT.name;
 const CLASS = "Lcom/example/Foo;";
 
 const evidenceOf = (value: unknown) =>
-  toolContract(TOOL).outputSchema.parse(value);
+  INSPECT_DEX_DEBUG_METADATA_CONTRACT.outputSchema.parse(value);
 
 /** The marks a note puts beside a member `entry` would refuse (owning formatter). */
 const LINK_MARK = refusalMark({
