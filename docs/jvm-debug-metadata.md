@@ -176,18 +176,21 @@ HotSpot's type-checking verifier, final from class version 51, rejects a
 length, falls inside an instruction rather than at its first byte ("Illegal
 local variable table start_pc" / "length"). A `wide` prefix and the opcode it
 modifies are one instruction, and `tableswitch`/`lookupswitch` padding is
-aligned from the start of the code array. A `LocalVariableTypeTable` row inside
-an instruction is rejected only when the method has at least one
-`LocalVariableTable` row (across all its occurrences): HotSpot then merges the
-type table into it, and the row's misaligned twin, or its lack of any matching
-row, rejects the class. With no `LocalVariableTable` row the type table is
-never merged or verified, so HotSpot loads the class; the row still reports
-`scope: "misaligned"` but its table stays `present`. A type-table scope outside
-the code is rejected either way. A version 50 class that fails this check is re-verified by the older verifier,
+aligned from the start of the code array. A `LocalVariableTypeTable` scope is
+checked only through the `LocalVariableTable` row it must match (see below):
+a misaligned type-table row reports `scope: "misaligned"`, and it is the
+matching row's own misalignment, or the lack of any matching row, that makes a
+table `malformed`; with no `LocalVariableTable` row it is never checked, as
+HotSpot loads such a class. A type-table scope outside the code is rejected
+either way. A version 50 class that fails this check is re-verified by the older verifier,
 which loads it, so below version 51 scopes are only checked against the code
 length (`in-code`). Line-number positions have no boundary rule: HotSpot
 accepts a `start_pc` inside an instruction. REA decodes each method's
-instruction lengths once, only when a local scope needs them; an instruction
+instruction lengths once, only when a local scope needs them, so a method
+with no local scope inside its code is not decoded, and bytecode HotSpot's
+verifier rejects there (such as `jsr` from version 51, or a `breakpoint`
+opcode) does not change its `state`, which describes its debug tables. An
+instruction
 stream that does not decode (an illegal opcode, an instruction past the code's
 end, `wide` before an opcode it cannot modify, a switch with `high < low` or a
 negative pair count, a switch whose fixed operands reach the code's end, or,
@@ -201,9 +204,18 @@ HotSpot reads `LocalVariableTypeTable` only from class version 49 and ignores it
 as an unknown attribute in older classes. REA still decodes it there and reports
 its `presence` by the same rules, so `malformed` keeps meaning that its bytes or
 entries are invalid, but in a class older than version 49 it never changes the
-method's `state`. REA stays more lenient than HotSpot on two rules: a
-`LocalVariableTypeTable` row with no matching `LocalVariableTable` row, and
-duplicate `LocalVariableTable` rows, are not checked.
+method's `state`.
+
+When a method's `LocalVariableTable` attributes declare at least one row,
+HotSpot's class-file parser matches the tables (`copy_localvariable_table`),
+keying each row by `start_pc`, `length`, name constant index and slot: from
+class version 49 a repeated `LocalVariableTable` key makes that table
+`malformed` ("Duplicated LocalVariableTable attribute entry"), and a
+`LocalVariableTypeTable` row with no matching key ("LVTT entry ... does not
+match any LVT entry"), or a second row matching the same key ("Duplicated
+LocalVariableTypeTable attribute entry"), makes the type table `malformed`.
+With no `LocalVariableTable` row the tables are not matched, as HotSpot does
+not match them.
 
 A method whose `Code` attribute declares a `code_length` outside 1 to 65,535,
 or holds a sub-attribute whose name index does not name a `CONSTANT_Utf8`

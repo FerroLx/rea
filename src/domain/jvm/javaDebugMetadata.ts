@@ -292,22 +292,16 @@ const scopeValid = (scope: LocalScope): boolean =>
   scope === "aligned" || scope === "in-code";
 
 /**
- * HotSpot checks a `LocalVariableTypeTable` row against instruction
- * boundaries only through the `LocalVariableTable`: it merges the type table
- * into the method's local-variable table only when that table has at least
- * one row (counting every occurrence), and the verifier walks the merged
- * table. With a row, a misaligned type-table row is rejected either way (its
- * matching row is misaligned too, or no row matches it). With none, it is
- * loaded and verified (OpenJDK 21 and 25), so its `misaligned` scope is kept
- * but does not make the table invalid. A scope outside the code is always
- * rejected by the class-file parser, and an undecodable stream by the
- * verifier, whatever the other table holds.
+ * HotSpot checks a `LocalVariableTypeTable` scope against instruction
+ * boundaries only through the `LocalVariableTable` row it must match, whose
+ * own scope is checked (see {@link matchLocalVariableTables}); a type-table
+ * row with no `LocalVariableTable` row at all is never verified. So a
+ * misaligned type-table scope does not by itself invalidate its table. A scope
+ * outside the code is always rejected by the class-file parser, and an
+ * undecodable stream by the verifier, so those, as unknown, never pass.
  */
-const typeScopeValid = (
-  scope: LocalScope,
-  localVariableRows: number,
-): boolean =>
-  scopeValid(scope) || (scope === "misaligned" && localVariableRows === 0);
+const typeScopeValid = (scope: LocalScope): boolean =>
+  scopeValid(scope) || scope === "misaligned";
 
 const decodeLocalVariableTable = (
   infos: readonly Uint8Array[],
@@ -375,7 +369,6 @@ const decodeLocalVariableTypeTable = (
   scopeOf: ScopeClassifier,
   maxLocals: number,
   majorVersion: number,
-  localVariableRows: number,
 ): DebugTable<LocalVariableTypeEntry> =>
   decodeTable(
     infos,
@@ -402,9 +395,68 @@ const decodeLocalVariableTypeTable = (
     (entry) =>
       legalLocalName(entry.name, majorVersion) &&
       entry.signature !== null &&
-      typeScopeValid(entry.scope, localVariableRows) &&
+      typeScopeValid(entry.scope) &&
       slotInFrame(entry.slot, maxLocals),
   );
+
+/** A table marked malformed, keeping its entries; `unread`/`absent` stay as they are. */
+const markMalformed = <T>(table: DebugTable<T>): DebugTable<T> =>
+  table.presence === "present" ? { ...table, presence: "malformed" } : table;
+
+/**
+ * HotSpot's `copy_localvariable_table`, which the class-file parser runs only
+ * when the method's `LocalVariableTable` attributes declare at least one row
+ * (`total_lvt_length > 0`), so with none the type table is never matched.
+ * Rows are keyed by `start_pc`, `length`, `name_index` and slot (the constant
+ * index, not the name it names). From class version 49 a repeated
+ * `LocalVariableTable` key is refused ("Duplicated LocalVariableTable
+ * attribute entry"); every type-table row must match a `LocalVariableTable`
+ * key ("LVTT entry ... does not match any LVT entry") and at most one row may
+ * match each ("Duplicated LocalVariableTypeTable attribute entry"). These are
+ * parse-time checks, made when the class is verified. The key set holds at
+ * most one string per decoded row, which the entry budget already bounds.
+ */
+const matchLocalVariableTables = (
+  localVariables: DebugTable<LocalVariableEntry>,
+  localVariableTypes: DebugTable<LocalVariableTypeEntry>,
+  majorVersion: number,
+): {
+  readonly localVariables: DebugTable<LocalVariableEntry>;
+  readonly localVariableTypes: DebugTable<LocalVariableTypeEntry>;
+} => {
+  if (localVariables.declaredCount === 0)
+    return { localVariables, localVariableTypes };
+  const key = (row: {
+    readonly startPc: number;
+    readonly length: number;
+    readonly nameIndex: number;
+    readonly slot: number;
+  }): string =>
+    `${String(row.startPc)}:${String(row.length)}:${String(row.nameIndex)}:${String(row.slot)}`;
+  const typed = new Map<string, boolean>();
+  let duplicateLocal = false;
+  for (const row of localVariables.entries) {
+    const rowKey = key(row);
+    if (typed.has(rowKey)) duplicateLocal = true;
+    else typed.set(rowKey, false);
+  }
+  let unmatchedType = false;
+  for (const row of localVariableTypes.entries) {
+    const rowKey = key(row);
+    const alreadyTyped = typed.get(rowKey);
+    if (alreadyTyped !== false) unmatchedType = true;
+    else typed.set(rowKey, true);
+  }
+  return {
+    localVariables:
+      duplicateLocal && majorVersion >= JAVA_5_MAJOR_VERSION
+        ? markMalformed(localVariables)
+        : localVariables,
+    localVariableTypes: unmatchedType
+      ? markMalformed(localVariableTypes)
+      : localVariableTypes,
+  };
+};
 
 /** Advance past the fixed Code header and exception table to its sub-attributes, keeping max_locals and the code array. */
 const seekCodeSubAttributes = (
@@ -551,7 +603,7 @@ export const decodeMethodDebugMetadata = (
       codeLength,
     ),
   );
-  const localVariables = orUnread(
+  const matched = matchLocalVariableTables(
     decodeLocalVariableTable(
       collectAttributes(attributes, "LocalVariableTable"),
       pool,
@@ -559,18 +611,17 @@ export const decodeMethodDebugMetadata = (
       maxLocals,
       majorVersion,
     ),
-  );
-  const localVariableTypes = orUnread(
     decodeLocalVariableTypeTable(
       collectAttributes(attributes, "LocalVariableTypeTable"),
       pool,
       scopeOf,
       maxLocals,
       majorVersion,
-      // HotSpot's total_lvt_length: the declared rows of every occurrence.
-      localVariables.declaredCount,
     ),
+    majorVersion,
   );
+  const localVariables = orUnread(matched.localVariables);
+  const localVariableTypes = orUnread(matched.localVariableTypes);
 
   const state = codeMalformed
     ? "malformed"

@@ -229,7 +229,8 @@ describe("decodeClassDebugMetadata — states and edge cases", () => {
           5,
           localVariableTable([
             { startPc: 0, length: 1, slot: 1 },
-            { startPc: 0, length: 1, slot: 1 },
+            // Same slot, another scope: reuse, not a duplicate row.
+            { startPc: 0, length: 0, slot: 1 },
           ]),
         ),
       ).parts,
@@ -748,7 +749,7 @@ describe("decodeClassDebugMetadata — local scopes and instruction boundaries",
     const method = decodeFixture(
       jvmDebugClass({
         code: BIPUSH_POP_RETURN,
-        locals: [local(0, 4)],
+        locals: [local(0, 4), local(2, 1)],
         typedLocals: [{ slot: 0, descriptor: "I", startPc: 2, length: 1 }],
       }),
     );
@@ -856,5 +857,86 @@ describe("decodeClassDebugMetadata — local scopes and instruction boundaries",
     expect(method.localVariables.entries[0]!.scope).toBe("unknown");
     expect(method.localVariables.presence).toBe("malformed");
     expect(method.state).toBe("malformed");
+  });
+});
+
+describe("decodeClassDebugMetadata — LocalVariableTable and type-table matching", () => {
+  const decodeFixture = (bytes: Uint8Array) => {
+    const cls = parseJavaClassFile(bytes);
+    if (!cls.ok) throw new Error(`fixture did not frame: ${cls.error.kind}`);
+    return decodeClassDebugMetadata(cls.value).methods[0]!;
+  };
+  const row = (startPc: number, length: number, nameIndex = 6) =>
+    ({ slot: 0, descriptor: "J", startPc, length, nameIndex }) as const;
+  const typed = (startPc: number, length: number, nameIndex = 6) =>
+    ({ slot: 0, descriptor: "I", startPc, length, nameIndex }) as const;
+  const code = [0x00, 0x00, 0xb1]; // nop; nop; return
+
+  // OpenJDK 21/25 ClassFormatError messages, from copy_localvariable_table.
+  it.each([
+    [
+      "a type row whose length differs (LVTT entry ... does not match any LVT entry)",
+      [row(0, 3)],
+      [typed(0, 2)],
+      "present",
+      "malformed",
+    ],
+    [
+      "a type row naming another constant (LVTT entry ... does not match any LVT entry)",
+      [row(0, 3)],
+      [typed(0, 3, 9)],
+      "present",
+      "malformed",
+    ],
+    [
+      "a repeated LocalVariableTable row (Duplicated LocalVariableTable attribute entry)",
+      [row(0, 3), row(0, 3)],
+      undefined,
+      "malformed",
+      "absent",
+    ],
+    [
+      "two type rows for one LocalVariableTable row (Duplicated LocalVariableTypeTable attribute entry)",
+      [row(0, 3)],
+      [typed(0, 3), typed(0, 3)],
+      "present",
+      "malformed",
+    ],
+  ] as const)("refuses %s", (_label, locals, typedLocals, lvt, lvtt) => {
+    const method = decodeFixture(
+      jvmDebugClass({
+        code,
+        locals,
+        ...(typedLocals === undefined ? {} : { typedLocals }),
+      }),
+    );
+    expect(method.localVariables.presence).toBe(lvt);
+    expect(method.localVariableTypes.presence).toBe(lvtt);
+    expect(method.state).toBe("malformed");
+  });
+
+  it("accepts a type row matching its LocalVariableTable row", () => {
+    const method = decodeFixture(
+      jvmDebugClass({ code, locals: [row(0, 3)], typedLocals: [typed(0, 3)] }),
+    );
+    expect(method.localVariableTypes.presence).toBe("present");
+    expect(method.state).toBe("present");
+  });
+
+  it("does not match type rows when the LocalVariableTable declares no row", () => {
+    // total_lvt_length is 0, so copy_localvariable_table never runs.
+    const method = decodeFixture(
+      jvmDebugClass({ code, locals: [], typedLocals: [typed(0, 2)] }),
+    );
+    expect(method.localVariableTypes.presence).toBe("present");
+    expect(method.state).toBe("present");
+  });
+
+  it("accepts a repeated LocalVariableTable row before version 49", () => {
+    const method = decodeFixture(
+      jvmDebugClass({ majorVersion: 48, code, locals: [row(0, 3), row(0, 3)] }),
+    );
+    expect(method.localVariables.presence).toBe("present");
+    expect(method.state).toBe("present");
   });
 });
