@@ -27,6 +27,10 @@ import {
   isLegalFieldDescriptor,
   isLegalFieldName,
 } from "./javaDescriptor.js";
+import {
+  decodeInstructionBoundaries,
+  SPLIT_VERIFIER_MAJOR_VERSION,
+} from "./javaBytecode.js";
 
 /**
  * Whether a named attribute was found and whether it decoded cleanly.
@@ -52,6 +56,25 @@ export interface LineNumberEntry {
   readonly outOfRange: boolean;
 }
 
+/**
+ * Where a local-variable scope `[startPc, startPc+length)` lies in its code.
+ * - `aligned`: inside the code, starting at an instruction and ending at one
+ *   or at `code_length` (checked from class version 51, as HotSpot does).
+ * - `in-code`: inside the code; instruction boundaries are not checked
+ *   because HotSpot does not check them below class version 51.
+ * - `misaligned`: inside the code, but the start or end falls inside an
+ *   instruction; HotSpot rejects the class (class version 51 and later).
+ * - `out-of-range`: starts at or after `code_length`, or ends past it.
+ * - `unknown`: inside the code, but the instruction stream does not decode,
+ *   so its boundaries are unknown (HotSpot's verifier rejects that method).
+ */
+export type LocalScope =
+  | "aligned"
+  | "in-code"
+  | "misaligned"
+  | "out-of-range"
+  | "unknown";
+
 export interface LocalVariableEntry {
   readonly startPc: number;
   readonly length: number;
@@ -61,8 +84,7 @@ export interface LocalVariableEntry {
   readonly descriptor: string | null;
   /** The local-variable array slot; wide (long/double) locals occupy this slot and the next. */
   readonly slot: number;
-  /** The scope `[startPc, startPc+length)` lies outside the method's code length. */
-  readonly outOfRange: boolean;
+  readonly scope: LocalScope;
 }
 
 export interface LocalVariableTypeEntry {
@@ -73,8 +95,7 @@ export interface LocalVariableTypeEntry {
   readonly signatureIndex: number;
   readonly signature: string | null;
   readonly slot: number;
-  /** The scope `[startPc, startPc+length)` lies outside the method's code length. */
-  readonly outOfRange: boolean;
+  readonly scope: LocalScope;
 }
 
 /** Overall debugging-readiness of one method's body. */
@@ -235,17 +256,46 @@ const decodeLineNumberTable = (
     (entry) => !entry.outOfRange,
   );
 
-/** A scope lies outside the code when it starts at/after the end or extends past it. */
-const scopeOutOfRange = (
-  startPc: number,
-  length: number,
-  codeLength: number,
-): boolean => startPc >= codeLength || startPc + length > codeLength;
+/** Classifies a local-variable scope against one method's code. */
+type ScopeClassifier = (startPc: number, length: number) => LocalScope;
+
+/**
+ * Build one method's scope classifier. HotSpot's class-file parser rejects a
+ * scope outside the code ("Invalid start_pc" / "Invalid length"); from class
+ * version 51 its verifier also rejects one whose start, or whose end short of
+ * `code_length`, is not an instruction start ("Illegal local variable table
+ * start_pc" / "length"), for `LocalVariableTable` rows directly and for
+ * `LocalVariableTypeTable` rows through the row each must match. The code is
+ * decoded at most once, on the first in-range scope, and never for a class
+ * below version 51 or a method without one.
+ */
+const scopeClassifier = (
+  code: Uint8Array,
+  majorVersion: number,
+): ScopeClassifier => {
+  const checksBoundaries = majorVersion >= SPLIT_VERIFIER_MAJOR_VERSION;
+  let boundaries: ReturnType<typeof decodeInstructionBoundaries> | undefined;
+  return (startPc, length) => {
+    const end = startPc + length;
+    if (startPc >= code.length || end > code.length) return "out-of-range";
+    if (!checksBoundaries) return "in-code";
+    boundaries ??= decodeInstructionBoundaries(code);
+    if (!boundaries.ok) return "unknown";
+    return boundaries.value.startsAt(startPc) &&
+      (end === code.length || boundaries.value.startsAt(end))
+      ? "aligned"
+      : "misaligned";
+  };
+};
+
+/** Only a scope known to lie on the code's instructions, or in it below 51, is valid. */
+const scopeValid = (scope: LocalScope): boolean =>
+  scope === "aligned" || scope === "in-code";
 
 const decodeLocalVariableTable = (
   infos: readonly Uint8Array[],
   pool: readonly ConstantPoolEntry[],
-  codeLength: number,
+  scopeOf: ScopeClassifier,
   maxLocals: number,
   majorVersion: number,
 ): DebugTable<LocalVariableEntry> =>
@@ -266,13 +316,14 @@ const decodeLocalVariableTable = (
         descriptorIndex,
         descriptor: resolveConstantUtf8(pool, descriptorIndex),
         slot,
-        outOfRange: scopeOutOfRange(startPc, length, codeLength),
+        scope: scopeOf(startPc, length),
       };
     },
-    // HotSpot rejects an out-of-code scope ("Invalid start_pc"/"Invalid
-    // length") as it rejects an out-of-frame slot or an illegal descriptor.
+    // HotSpot rejects an out-of-code or misaligned scope as it rejects an
+    // out-of-frame slot or an illegal descriptor; an unknown scope is never
+    // reported valid.
     (entry) =>
-      !entry.outOfRange &&
+      scopeValid(entry.scope) &&
       legalLocalName(entry.name, majorVersion) &&
       entry.descriptor !== null &&
       isLegalFieldDescriptor(entry.descriptor, majorVersion) &&
@@ -304,7 +355,7 @@ const legalLocalName = (name: string | null, majorVersion: number): boolean =>
 const decodeLocalVariableTypeTable = (
   infos: readonly Uint8Array[],
   pool: readonly ConstantPoolEntry[],
-  codeLength: number,
+  scopeOf: ScopeClassifier,
   maxLocals: number,
   majorVersion: number,
 ): DebugTable<LocalVariableTypeEntry> =>
@@ -325,7 +376,7 @@ const decodeLocalVariableTypeTable = (
         signatureIndex,
         signature: resolveConstantUtf8(pool, signatureIndex),
         slot,
-        outOfRange: scopeOutOfRange(startPc, length, codeLength),
+        scope: scopeOf(startPc, length),
       };
     },
     // A signature names no wide primitive, so only the entry's own slot is
@@ -333,31 +384,34 @@ const decodeLocalVariableTypeTable = (
     (entry) =>
       legalLocalName(entry.name, majorVersion) &&
       entry.signature !== null &&
-      !entry.outOfRange &&
+      scopeValid(entry.scope) &&
       slotInFrame(entry.slot, maxLocals),
   );
 
-/** Advance past the fixed Code header and exception table to its sub-attributes, keeping max_locals and code_length. */
+/** Advance past the fixed Code header and exception table to its sub-attributes, keeping max_locals and the code array. */
 const seekCodeSubAttributes = (
-  code: Uint8Array,
+  attribute: Uint8Array,
 ): {
   readonly cursor: ByteCursor;
   readonly maxLocals: number;
-  readonly codeLength: number;
+  /** The `code` array, a view of the attribute; its length is `code_length`. */
+  readonly code: Uint8Array;
 } | null => {
-  const cursor = new ByteCursor(code);
+  const cursor = new ByteCursor(attribute);
   if (!cursor.u2().ok) return null; // max_stack
   const maxLocals = cursor.u2();
   if (!maxLocals.ok) return null;
   const codeLength = cursor.u4();
-  if (!codeLength.ok || !cursor.slice(codeLength.value).ok) return null;
+  if (!codeLength.ok) return null;
+  const code = cursor.slice(codeLength.value);
+  if (!code.ok) return null;
   const exceptionTableLength = cursor.u2();
   if (
     !exceptionTableLength.ok ||
     !cursor.slice(exceptionTableLength.value * 8).ok
   )
     return null;
-  return { cursor, maxLocals: maxLocals.value, codeLength: codeLength.value };
+  return { cursor, maxLocals: maxLocals.value, code: code.value };
 };
 
 const computeReusedSlots = (
@@ -459,12 +513,15 @@ export const decodeMethodDebugMetadata = (
   // A code_length outside 1..65535 makes HotSpot reject the method too.
   const codeMalformed =
     seeked === null ||
-    seeked.codeLength < 1 ||
-    seeked.codeLength > MAX_CODE_LENGTH ||
+    seeked.code.length < 1 ||
+    seeked.code.length > MAX_CODE_LENGTH ||
     (framed?.error ?? null) !== null ||
     seeked.cursor.remaining !== 0;
-  const codeLength = seeked?.codeLength ?? 0;
+  const code = seeked?.code ?? new Uint8Array(0);
+  const codeLength = code.length;
   const maxLocals = seeked?.maxLocals ?? 0;
+  // One classifier per method: both local tables share its single decode.
+  const scopeOf = scopeClassifier(code, majorVersion);
   const orUnread = <T>(table: DebugTable<T>): DebugTable<T> =>
     codeMalformed && table.presence === "absent"
       ? { ...table, presence: "unread" }
@@ -480,7 +537,7 @@ export const decodeMethodDebugMetadata = (
     decodeLocalVariableTable(
       collectAttributes(attributes, "LocalVariableTable"),
       pool,
-      codeLength,
+      scopeOf,
       maxLocals,
       majorVersion,
     ),
@@ -489,7 +546,7 @@ export const decodeMethodDebugMetadata = (
     decodeLocalVariableTypeTable(
       collectAttributes(attributes, "LocalVariableTypeTable"),
       pool,
-      codeLength,
+      scopeOf,
       maxLocals,
       majorVersion,
     ),

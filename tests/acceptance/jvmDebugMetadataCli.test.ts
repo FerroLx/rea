@@ -192,6 +192,53 @@ cliTest(
 );
 
 cliTest(
+  "reports a local scope inside an instruction as malformed from version 51 over CLI and MCP",
+  async ({ cli }) => {
+    const root = await createTestTempDirectory("rea-jvm-boundaries-");
+    const { client, call } = await connectLocalToolsMcp();
+    // bipush 5; pop; return: a scope starting at pc 1 starts in bipush's
+    // operand. HotSpot 21/25 verify a version 51+ class and refuse it
+    // ("Illegal local variable table start_pc 1"); a version 50 class fails
+    // over to the old verifier and loads. A line number at pc 1 is accepted.
+    const code = [0x10, 0x05, 0x57, 0xb1];
+    const cases = [
+      { majorVersion: 52, state: "malformed", scope: "misaligned" },
+      { majorVersion: 50, state: "present", scope: "in-code" },
+    ] as const;
+    for (const { majorVersion, state, scope } of cases) {
+      const path = join(root, `v${String(majorVersion)}.class`);
+      await writeFile(
+        path,
+        jvmDebugClass({
+          majorVersion,
+          code,
+          linePc: 1,
+          locals: [{ slot: 0, descriptor: "J", startPc: 1, length: 3 }],
+        }),
+      );
+      const outcome = await inspectBoth(cli, call, { path });
+      if (!outcome.ok) throw new Error(JSON.stringify(outcome.error));
+      expect(outcome.evidence).toMatchObject({
+        normalized_result: {
+          methods: [
+            {
+              state,
+              line_number_table: { presence: "present" },
+              local_variable_table: {
+                presence: state,
+                entries: [{ start_pc: 1, length: 3, scope }],
+              },
+            },
+          ],
+        },
+      });
+    }
+    await client.ping();
+  },
+  30000,
+);
+
+cliTest(
   "names unflagged JAR members as the JDK does (UTF-8) over CLI and MCP",
   async ({ cli }) => {
     const root = await createTestTempDirectory("rea-jvm-names-");

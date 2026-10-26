@@ -100,7 +100,13 @@ The normalized result binds every fact to exact identity:
   - `line_number_table` — `start_pc` → `line_number` entries, and
     `out_of_range` (`start_pc` is not an index into the method's code array).
   - `local_variable_table` — `start_pc`, `length`, `name`, `descriptor`, `slot`,
-    and `out_of_range` (the scope lies outside the method's code length).
+    and `scope`, where the scope `[start_pc, start_pc+length)` lies in the code:
+    `aligned` (it starts at an instruction and ends at one or at the code's
+    end), `in-code` (inside the code; instruction boundaries are not checked
+    below class version 51, as HotSpot does not check them there),
+    `misaligned` (its start or end falls inside an instruction), `out-of-range`
+    (outside the method's code length), or `unknown` (the instruction stream
+    does not decode, so its boundaries are unknown).
   - `local_variable_type_table` — as above with a generic `signature`.
   - `reused_slots` — slots that appear in more than one local-variable entry.
     Reuse is legal; a reused slot may denote different variables across disjoint
@@ -136,8 +142,9 @@ attribute is `malformed`, with `max_locals` `null` and every table `unread`,
 because which body is meant is unknown.
 
 A table entry HotSpot rejects the class for also makes its table `malformed`,
-with the raw values kept: a line `start_pc` or local-variable scope flagged
-`out_of_range`, a local-variable `slot` at or past `max_locals` (for a `J` or
+with the raw values kept: a line `start_pc` flagged `out_of_range`, a
+local-variable `scope` that is `out-of-range` or `misaligned`, a local-variable
+`slot` at or past `max_locals` (for a `J` or
 `D` `LocalVariableTable` descriptor, the second slot `slot + 1` too), a
 local-variable name HotSpot rejects as a field name, or a `LocalVariableTable`
 descriptor that is not a legal field descriptor (JVMS §4.3.2, such as `Q`, `V`,
@@ -146,6 +153,26 @@ unqualified name (no `.`, `;`, `[` or `/`); older classes use Java identifier
 rules, which REA checks exactly for ASCII and accepts for any non-ASCII
 character. A `LocalVariableTypeTable` signature is not checked for grammar, as
 HotSpot does not check it.
+
+HotSpot's type-checking verifier, final from class version 51, rejects a
+`LocalVariableTable` scope whose `start_pc`, or whose end short of the code
+length, falls inside an instruction rather than at its first byte ("Illegal
+local variable table start_pc" / "length"). A `wide` prefix and the opcode it
+modifies are one instruction, and `tableswitch`/`lookupswitch` padding is
+aligned from the start of the code array. A `LocalVariableTypeTable` row is
+judged by the same rule, because HotSpot rejects the class either way: its
+matching `LocalVariableTable` row is misaligned too, or no row matches it. A
+version 50 class that fails this check is re-verified by the older verifier,
+which loads it, so below version 51 scopes are only checked against the code
+length (`in-code`). Line-number positions have no boundary rule: HotSpot
+accepts a `start_pc` inside an instruction. REA decodes each method's
+instruction lengths once, only when a local scope needs them; an instruction
+stream that does not decode (an illegal opcode, an instruction past the code's
+end, `wide` before an opcode it cannot modify, or a switch with `high < low` or
+a negative pair count), which HotSpot's verifier also rejects, leaves every
+in-code scope `unknown` and its table `malformed`, never `present`. Like every
+check on this page, this follows a JVM that verifies the class, as it does by
+default for classes outside the boot class path.
 
 HotSpot reads `LocalVariableTypeTable` only from class version 49 and ignores it
 as an unknown attribute in older classes. REA still decodes it there and reports
@@ -183,9 +210,9 @@ the encoded size of every constant-pool string each entry references, so a class
 with too many entries, or whose shared long names would expand past the inline
 output budget, is refused without building the report; the exact serialized
 size is checked again afterwards. A local-variable scope whose `[start_pc, start_pc+length)`
-lies outside the method's code length, or a line entry whose `start_pc` is at
-or past it, is surfaced as declared and flagged `out_of_range: true`, never
-silently corrected. A class file with bytes after its last attribute is
+lies outside the method's code length is surfaced as declared with `scope:
+"out-of-range"`, and a line entry whose `start_pc` is at or past it with
+`out_of_range: true`, never silently corrected. A class file with bytes after its last attribute is
 refused as invalid input, as HotSpot refuses it, as is a class whose
 `constant_pool_count` is 0, whose last constant-pool slot holds a `long` or
 `double` (its second slot would lie outside the pool), or whose field, method

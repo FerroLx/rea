@@ -211,8 +211,8 @@ describe("decodeClassDebugMetadata", () => {
     if (!cls.ok) return;
     const entries = decodeClassDebugMetadata(cls.value).methods[0]!
       .localVariables.entries;
-    expect(entries[0]!.outOfRange).toBe(false);
-    expect(entries[1]!.outOfRange).toBe(true);
+    expect(entries[0]!.scope).toBe("aligned");
+    expect(entries[1]!.scope).toBe("out-of-range");
     // HotSpot rejects the class ("Invalid length"): flagged and kept, malformed.
     const method = decodeClassDebugMetadata(cls.value).methods[0]!;
     expect(method.localVariables.presence).toBe("malformed");
@@ -705,6 +705,109 @@ describe("decodeClassDebugMetadata — HotSpot load checks", () => {
         typedLocals: [{ slot: 0, descriptor: "I", nameIndex: 10 }],
       }),
     );
+    expect(method.state).toBe("malformed");
+  });
+});
+
+describe("decodeClassDebugMetadata — local scopes and instruction boundaries", () => {
+  const decodeFixture = (bytes: Uint8Array) => {
+    const cls = parseJavaClassFile(bytes);
+    if (!cls.ok) throw new Error(`fixture did not frame: ${cls.error.kind}`);
+    return decodeClassDebugMetadata(cls.value).methods[0]!;
+  };
+  // bipush 5 (pc 0-1); pop (pc 2); return (pc 3): pc 1 is an operand byte.
+  const BIPUSH_POP_RETURN = [0x10, 0x05, 0x57, 0xb1];
+  const local = (startPc: number, length: number) =>
+    ({ slot: 0, descriptor: "J", startPc, length }) as const;
+
+  // HotSpot 21/25 (version 51+): "Illegal local variable table start_pc 1"
+  // and "Illegal local variable table length 1".
+  it.each([
+    ["start", local(1, 3)],
+    ["end", local(0, 1)],
+    ["empty scope's start", local(1, 0)],
+  ])(
+    "reports a scope whose %s falls inside an instruction as misaligned from version 51",
+    (_label, row) => {
+      for (const majorVersion of [51, 52, 69]) {
+        const method = decodeFixture(
+          jvmDebugClass({
+            majorVersion,
+            code: BIPUSH_POP_RETURN,
+            locals: [row],
+          }),
+        );
+        expect(method.localVariables.entries[0]!.scope).toBe("misaligned");
+        expect(method.localVariables.presence).toBe("malformed");
+        expect(method.state).toBe("malformed");
+      }
+    },
+  );
+
+  it("accepts scopes that start and end on instructions or at code_length", () => {
+    const method = decodeFixture(
+      jvmDebugClass({
+        code: BIPUSH_POP_RETURN,
+        locals: [local(0, 4)],
+        typedLocals: [{ slot: 0, descriptor: "I", startPc: 2, length: 1 }],
+      }),
+    );
+    expect(method.localVariables.entries[0]!.scope).toBe("aligned");
+    expect(method.localVariableTypes.entries[0]!.scope).toBe("aligned");
+    expect(method.state).toBe("present");
+  });
+
+  it("judges a type-table scope by the same rule from version 51", () => {
+    // Its LocalVariableTable twin is misaligned, or no twin matches it: HotSpot
+    // rejects the class either way.
+    const method = decodeFixture(
+      jvmDebugClass({
+        code: BIPUSH_POP_RETURN,
+        locals: [local(0, 4)],
+        typedLocals: [{ slot: 0, descriptor: "I", startPc: 1, length: 3 }],
+      }),
+    );
+    expect(method.localVariableTypes.entries[0]!.scope).toBe("misaligned");
+    expect(method.localVariableTypes.presence).toBe("malformed");
+    expect(method.state).toBe("malformed");
+  });
+
+  // Version 50 fails over to the inference verifier, which does not check
+  // scopes; version 49 never uses the type-checking verifier.
+  it.each([49, 50])(
+    "does not check boundaries in a version %i class",
+    (majorVersion) => {
+      const method = decodeFixture(
+        jvmDebugClass({
+          majorVersion,
+          code: BIPUSH_POP_RETURN,
+          locals: [local(1, 3)],
+        }),
+      );
+      expect(method.localVariables.entries[0]!.scope).toBe("in-code");
+      expect(method.state).toBe("present");
+    },
+  );
+
+  it("leaves line numbers inside an instruction valid, as HotSpot does", () => {
+    const method = decodeFixture(
+      jvmDebugClass({
+        code: BIPUSH_POP_RETURN,
+        linePc: 1,
+        locals: [local(0, 4)],
+      }),
+    );
+    expect(method.lineNumbers.presence).toBe("present");
+    expect(method.state).toBe("present");
+  });
+
+  it("reports an in-code scope over an undecodable stream as unknown, never present", () => {
+    // 0xcb is no JVM instruction; HotSpot's verifier rejects the method.
+    const method = decodeFixture(
+      jvmDebugClass({ code: [0x00, 0xcb, 0xb1], locals: [local(0, 3)] }),
+    );
+    expect(method.localVariables.entries[0]!.scope).toBe("unknown");
+    expect(method.localVariables.presence).toBe("malformed");
     expect(method.state).toBe("malformed");
   });
 });

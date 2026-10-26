@@ -11,8 +11,9 @@ export interface JvmFixtureLocal {
 
 /**
  * Build a class `Example` with one static method `run(J)V` whose Code
- * attribute (code_length 1, `return`) carries a LineNumberTable, the given
- * LocalVariableTable rows and, optionally, LocalVariableTypeTable rows.
+ * attribute (by default code_length 1, `return`; `code` replaces the bytecode)
+ * carries a LineNumberTable, the given LocalVariableTable rows and,
+ * optionally, LocalVariableTypeTable rows.
  * `trailingBytes` appends bytes after the class-file structure; `majorVersion`
  * sets the class-file version (default 52).
  */
@@ -24,6 +25,7 @@ export const jvmDebugClass = (
     readonly linePc?: number;
     readonly trailingBytes?: number;
     readonly majorVersion?: number;
+    readonly code?: readonly number[];
   } = {},
 ): Buffer => {
   const out: number[] = [];
@@ -130,16 +132,17 @@ export const jvmDebugClass = (
       ? []
       : table(11, options.typedLocals)),
   ];
+  const bytecode = options.code ?? [0xb1]; // return
   const code = [
     0,
     1, // max_stack
     ((options.maxLocals ?? 2) >> 8) & 0xff,
     (options.maxLocals ?? 2) & 0xff,
-    0,
-    0,
-    0,
-    1, // code_length
-    0xb1, // return
+    (bytecode.length >>> 24) & 0xff,
+    (bytecode.length >> 16) & 0xff,
+    (bytecode.length >> 8) & 0xff,
+    bytecode.length & 0xff, // code_length
+    ...bytecode,
     0,
     0, // exception_table_length
     0,

@@ -15,7 +15,10 @@ import {
 } from "../evidence.js";
 import type { JsonValue } from "../jsonValue.js";
 import { type JavaClassFile, resolveConstantUtf8 } from "./javaClassFile.js";
-import { decodeClassDebugMetadata } from "./javaDebugMetadata.js";
+import {
+  decodeClassDebugMetadata,
+  type LocalScope,
+} from "./javaDebugMetadata.js";
 import { buildJavaDebugMetadataEvidence } from "./javaDebugMetadataEvidence.js";
 
 const digest = z.string().regex(/^[a-f0-9]{64}$/);
@@ -80,13 +83,21 @@ const lineNumberEntry = z.strictObject({
   line_number: z.number().int().nonnegative(),
   out_of_range: z.boolean(),
 });
+/** Where a local's scope lies in its method's code; see {@link LocalScope}. */
+const localScope = z.enum([
+  "aligned",
+  "in-code",
+  "misaligned",
+  "out-of-range",
+  "unknown",
+] as const satisfies readonly LocalScope[]);
 const localVariableEntry = z.strictObject({
   start_pc: z.number().int().nonnegative(),
   length: z.number().int().nonnegative(),
   name: z.string().nullable(),
   descriptor: z.string().nullable(),
   slot: z.number().int().nonnegative(),
-  out_of_range: z.boolean(),
+  scope: localScope,
 });
 const localVariableTypeEntry = z.strictObject({
   start_pc: z.number().int().nonnegative(),
@@ -94,7 +105,7 @@ const localVariableTypeEntry = z.strictObject({
   name: z.string().nullable(),
   signature: z.string().nullable(),
   slot: z.number().int().nonnegative(),
-  out_of_range: z.boolean(),
+  scope: localScope,
 });
 const table = <Entry extends z.ZodTypeAny>(entry: Entry) =>
   z.strictObject({
@@ -255,7 +266,7 @@ export const buildJavaDebugMetadataResult = (
           name: e.name,
           descriptor: e.descriptor,
           slot: e.slot,
-          out_of_range: e.outOfRange,
+          scope: e.scope,
         })),
       },
       local_variable_type_table: {
@@ -267,7 +278,7 @@ export const buildJavaDebugMetadataResult = (
           name: e.name,
           signature: e.signature,
           slot: e.slot,
-          out_of_range: e.outOfRange,
+          scope: e.scope,
         })),
       },
       reused_slots: [...m.reusedSlots],

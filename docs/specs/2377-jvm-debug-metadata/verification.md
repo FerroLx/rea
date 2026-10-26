@@ -214,6 +214,37 @@ fallback. The JDK reads the raw central-directory name and ignores an Info-ZIP
 Unicode Path extra field, which REA's ZIP reader prefers. A manifest member
 the ZIP reader classifies as a directory or symlink is not read.
 
+## JarFile parity and instruction boundaries
+
+Four further differences from OpenJDK 21/25 were checked against the real
+runtimes (`JarFile` probes, and `ClassFormatError`/`VerifyError` from loading
+patched `javac` classes through a `URLClassLoader`) and fixed:
+
+- `new JarFile(...)` throws "invalid CEN header (encrypted entry)" when any
+  central-directory record sets flag bit 0, whichever member is requested (a
+  local-header-only flag is ignored). The JDK view of the shared ZIP reader now
+  refuses such an archive during enumeration.
+- `JarFile` reads a class whatever unrelated members declare. The JVM provider
+  now charges the decompression budget only for members it opens (the manifest
+  and the selected class); entry count and central-directory size stay bounded
+  by the metadata read budget. Other ZIP consumers keep enumeration-time
+  accounting.
+- `JarFile.getEntry` never versions a `META-INF/` name, so
+  `META-INF/versions/<N>/META-INF/...` is a plain member, not an override.
+- From class version 51 HotSpot's verifier rejects a `LocalVariableTable` scope
+  whose start, or whose end short of `code_length`, is not an instruction start
+  ("Illegal local variable table start_pc"/"length"); `wide` counts as part of
+  its instruction and switch padding is aligned from the code start. Version 49
+  and 50 classes load (50 fails over to the old verifier), and so does a class
+  loaded without verification. A `LocalVariableTypeTable` row inside an
+  instruction is rejected too, either through its misaligned twin or as
+  matching no row. Line-number `start_pc` values have no boundary rule. Local
+  entries now carry `scope` (`aligned`, `in-code`, `misaligned`,
+  `out-of-range`, `unknown`) in place of `out_of_range`; an undecodable
+  instruction stream (each tested form gives `VerifyError: Bad instruction`
+  or, for 0xcb, an earlier boundary `ClassFormatError`) leaves scopes
+  `unknown` and the table `malformed`.
+
 ## Still owed (follow-ups, not blocking)
 
 - A JDK-free CLI/MCP workflow test (e.g. `localToolContracts` pathRequests plus
