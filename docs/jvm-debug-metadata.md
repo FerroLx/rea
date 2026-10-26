@@ -49,10 +49,27 @@ resource that never supplies the entry, an override, or an ambiguity. Stored
 names are decoded as the JDK's `JarFile` decodes them: as UTF-8 whether or not
 the ZIP language-encoding flag is set. A JAR holding a member name or entry
 comment that is not valid UTF-8 is refused as invalid input, because the JDK
-refuses to open it ("invalid CEN header (bad entry name or comment)"). So is a
-JAR whose central directory flags any member as encrypted, whichever member is
-requested: the JDK refuses to open it too ("invalid CEN header (encrypted
-entry)", OpenJDK 21 and 25).
+refuses to open it ("invalid CEN header (bad entry name or comment)"). So is,
+whichever member is requested, a JAR holding any other central-directory
+record OpenJDK 25's `ZipFile` refuses to index, and REA names the JDK's
+message: a record flagged as encrypted ("encrypted entry"), one whose
+compression method is neither stored (0) nor deflated (8) ("bad compression
+method"), one whose header (46 bytes plus name, extra field and comment)
+exceeds 65,535 bytes ("bad header size"), an extra field whose declared size
+runs past the record's extra data, a zip64 extra field whose size is not
+exactly what the record's `0xFFFFFFFF`/`0xFFFF` markers call for, or such a
+marker on a record with no extra data. A central directory that does not end
+exactly at its last record (a record running past it, trailing bytes, or a
+digital-signature record) is refused too ("bad header size"). OpenJDK 21 does
+not make the header-size and zip64 extra-field checks.
+
+REA is stricter than `JarFile` in a few cases, where it refuses the JAR as
+invalid input rather than answering: a member REA reads (the manifest or the
+selected class) whose local header disagrees with its central-directory record
+(an encryption flag, sizes or compression method set in only one of them) or
+whose CRC-32 does not match its bytes, and any record whose zip64 size or
+offset exceeds 2^53 − 1. OpenJDK 21 and 25 open these archives and read the
+members.
 
 A JAR is multi-release exactly when the JDK's `JarFile.isMultiRelease()` would
 say so (OpenJDK 25, default settings): the manifest is the member stored as

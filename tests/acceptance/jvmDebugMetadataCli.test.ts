@@ -472,6 +472,121 @@ cliTest(
   30000,
 );
 
+cliTest(
+  "refuses a JAR whose central directory JarFile rejects over CLI and MCP",
+  async ({ cli }) => {
+    const root = await createTestTempDirectory("rea-jvm-cen-");
+    const { client, call } = await connectLocalToolsMcp();
+    const example = {
+      name: Buffer.from("Example.class"),
+      bytes: jvmDebugClass(),
+    };
+    const other = { name: Buffer.from("other.txt"), bytes: Buffer.from("x") };
+    const extraField = (tag: number, size: number): Buffer => {
+      const field = Buffer.alloc(4 + size);
+      field.writeUInt16LE(tag, 0);
+      field.writeUInt16LE(size, 2);
+      return field;
+    };
+    // Each refused by OpenJDK 25 `new JarFile(...)` with the quoted message.
+    const cases = [
+      {
+        name: "unrelated-method-9",
+        members: [example, { ...other, method: 9 }],
+        message: "bad compression method: 9",
+      },
+      {
+        name: "selected-method-9",
+        members: [{ ...example, method: 9 }],
+        message: "bad compression method: 9",
+      },
+      {
+        // 46 + 9-byte name + 65,491-byte extra field > 0xFFFF.
+        name: "header-too-big",
+        members: [
+          example,
+          { ...other, centralExtra: extraField(0xcafe, 65_487) },
+        ],
+        message: "bad header size",
+      },
+      {
+        name: "extra-field-overrun",
+        members: [
+          example,
+          { ...other, centralExtra: extraField(0xcafe, 9).subarray(0, 6) },
+        ],
+        message: "invalid extra data field size for tag: 0xcafe",
+      },
+      {
+        name: "zip64-escape-without-extra",
+        members: [example, { ...other, declaredCompressedSize: 0xffffffff }],
+        message: "invalid zip64 extra len size",
+      },
+      {
+        name: "zip64-block-not-escaped",
+        members: [example, { ...other, centralExtra: extraField(0x0001, 8) }],
+        message: "invalid zip64 extra data field size",
+      },
+    ] as const;
+    for (const { name, members, message } of cases) {
+      const path = join(root, `${name}.jar`);
+      await writeFile(path, storedZip(members));
+      const outcome = await inspectBoth(cli, call, {
+        path,
+        entry: "Example.class",
+      });
+      expect(outcome, name).toMatchObject({
+        ok: false,
+        error: {
+          code: "invalid_request",
+          details: {
+            issues: [
+              {
+                path: ["path"],
+                reason: "invalid_format",
+                message: expect.stringContaining(message) as string,
+              },
+            ],
+          },
+        },
+      });
+    }
+    // The same archive with a central directory that does not end at its
+    // last record: "invalid CEN header (bad header size)".
+    const trailing = storedZip([example]);
+    const end = trailing.length - 22;
+    const directorySize = trailing.readUInt32LE(end + 12);
+    const padded = Buffer.concat([
+      trailing.subarray(0, end),
+      Buffer.alloc(4),
+      trailing.subarray(end),
+    ]);
+    padded.writeUInt32LE(directorySize + 4, end + 4 + 12);
+    const paddedPath = join(root, "directory-trailing-bytes.jar");
+    await writeFile(paddedPath, padded);
+    expect(
+      await inspectBoth(cli, call, {
+        path: paddedPath,
+        entry: "Example.class",
+      }),
+    ).toMatchObject({
+      ok: false,
+      error: {
+        details: {
+          issues: [
+            {
+              reason: "invalid_format",
+              message: expect.stringContaining("bad header size") as string,
+            },
+          ],
+        },
+      },
+    });
+    await client.ping();
+  },
+  60000,
+);
+
 cliTest.skipIf(process.platform === "win32")(
   "reads the file a symlink-relative path names, not its lexical rewrite",
   async ({ cli }) => {

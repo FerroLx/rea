@@ -8,6 +8,12 @@ export interface StoredZipMember {
   readonly flags?: number;
   /** Declared uncompressed size in the central directory, if not the real one. */
   readonly declaredSize?: number;
+  /** Declared compressed size in the central directory, if not the real one. */
+  readonly declaredCompressedSize?: number;
+  /** Compression method declared in both headers (default 0, stored). */
+  readonly method?: number;
+  /** Central-directory extra field bytes (the local header carries none). */
+  readonly centralExtra?: Uint8Array;
 }
 
 /**
@@ -25,6 +31,7 @@ export const storedZip = (members: readonly StoredZipMember[]): Buffer => {
     header.writeUInt32LE(0x04034b50, 0);
     header.writeUInt16LE(20, 4);
     header.writeUInt16LE(flags, 6);
+    header.writeUInt16LE(member.method ?? 0, 8);
     header.writeUInt32LE(crc, 14);
     header.writeUInt32LE(member.bytes.length, 18);
     header.writeUInt32LE(member.bytes.length, 22);
@@ -34,13 +41,19 @@ export const storedZip = (members: readonly StoredZipMember[]): Buffer => {
     record.writeUInt16LE(20, 4);
     record.writeUInt16LE(20, 6);
     record.writeUInt16LE(flags, 8);
+    record.writeUInt16LE(member.method ?? 0, 10);
     record.writeUInt32LE(crc, 16);
-    record.writeUInt32LE(member.bytes.length, 20);
+    record.writeUInt32LE(
+      member.declaredCompressedSize ?? member.bytes.length,
+      20,
+    );
     record.writeUInt32LE(member.declaredSize ?? member.bytes.length, 24);
     record.writeUInt16LE(member.name.length, 28);
+    const extra = member.centralExtra ?? new Uint8Array(0);
+    record.writeUInt16LE(extra.length, 30);
     record.writeUInt32LE(offset, 42);
     local.push(header, Buffer.from(member.name), Buffer.from(member.bytes));
-    central.push(record, Buffer.from(member.name));
+    central.push(record, Buffer.from(member.name), Buffer.from(extra));
     offset += 30 + member.name.length + member.bytes.length;
   }
   const directory = Buffer.concat(central);

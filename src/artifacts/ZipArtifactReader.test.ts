@@ -13,6 +13,7 @@ import {
 } from "@zip.js/zip.js";
 import { describe, expect, it, vi } from "vitest";
 
+import { storedZip } from "../../tests/fixtures/storedZip.js";
 import { createTestTempDirectory } from "../../tests/fixtures/temporaryDirectory.js";
 
 import { ZipArtifactReader } from "./ZipArtifactReader.js";
@@ -459,6 +460,54 @@ describe("ZipArtifactReader JDK view", () => {
     } finally {
       await legacy.close();
       await jdk.close();
+    }
+  });
+});
+
+describe("ZipArtifactReader JDK view central-directory records", () => {
+  const zip64 = (values: readonly bigint[]): Buffer => {
+    const field = Buffer.alloc(4 + values.length * 8);
+    field.writeUInt16LE(0x0001, 0);
+    field.writeUInt16LE(values.length * 8, 2);
+    values.forEach((value, index) =>
+      field.writeBigUInt64LE(value, 4 + index * 8),
+    );
+    return field;
+  };
+  // OpenJDK 25 `new JarFile(...)` verdicts on the same archives.
+  it.each([
+    ["a zip64 block holding exactly the escaped size", [1n], null],
+    [
+      "a zip64 block longer than the escaped values",
+      [1n, 1n],
+      "invalid zip64 extra data field size",
+    ],
+  ] as const)("judges %s as the JDK does", async (_label, values, refusal) => {
+    const directory = await createTestTempDirectory("rea-zip-jdk-zip64-");
+    const path = join(directory, "zip64.zip");
+    await writeFile(
+      path,
+      storedZip([
+        {
+          name: Buffer.from("member.txt"),
+          bytes: Buffer.from("x"),
+          declaredSize: 0xffffffff,
+          centralExtra: zip64(values),
+        },
+      ]),
+    );
+    const reader = new ZipArtifactReader(path, "zip", undefined, undefined, {
+      view: "jdk",
+    });
+    try {
+      if (refusal === null) expect(await enumerate(reader)).toBe(1);
+      else
+        await expect(enumerate(reader)).rejects.toMatchObject({
+          reason: "format",
+          message: expect.stringContaining(refusal) as string,
+        });
+    } finally {
+      await reader.close();
     }
   });
 });

@@ -22,6 +22,7 @@ import {
   ERR_UNSUPPORTED_ENCRYPTION,
   ERR_UNSUPPORTED_UINT64,
   Reader,
+  WARNING_TRAILING_CENTRAL_DIRECTORY_DATA,
   ZipReader,
   type Entry,
   type FileEntry,
@@ -35,6 +36,7 @@ import {
   type ArtifactReader,
 } from "./ArtifactReader.js";
 import type { ZipPackageFormat } from "../domain/zipPackageFormat.js";
+import { jdkCentralDirectoryRefusal } from "./JdkZipCentralDirectory.js";
 import {
   ARTIFACT_EXPANSION_RATIO,
   artifactExpansionBudgetBytes,
@@ -182,13 +184,14 @@ class NodeFileReader extends Reader<string> {
  * Whose reading of the archive this reader reproduces.
  * `zip-legacy` follows the ZIP specification: unflagged member names are CP437
  * (as Python's zipfile reads them) and an encrypted member is enumerated but
- * cannot be opened. `jdk` is OpenJDK's `ZipFile`/`JarFile` view at the default
- * charset, and fails enumeration as `format` wherever the JDK refuses to open
- * the whole archive: every name and entry comment is UTF-8 whatever the flag
- * says, so one that is not valid UTF-8 is refused ("invalid CEN header (bad
- * entry name or comment)"), and so is any central-directory record with the
- * encryption flag (bit 0) set, whichever member it names ("invalid CEN header
- * (encrypted entry)", OpenJDK 21 and 25; the local header's flag is not read).
+ * cannot be opened. `jdk` is OpenJDK 25's `ZipFile`/`JarFile` view at the
+ * default charset, and fails enumeration as `format` wherever the JDK refuses
+ * to open the whole archive for one central-directory record: every name and
+ * entry comment is UTF-8 whatever the flag says, so one that is not valid
+ * UTF-8 is refused ("invalid CEN header (bad entry name or comment)"), and so
+ * is every other record `ZipFile.Source.checkAndAddEntry` rejects (see
+ * {@link jdkCentralDirectoryRefusal}), whichever member it names. Checks the
+ * JDK makes only on the local header or member data are not made here.
  */
 export type ZipArchiveView = "zip-legacy" | "jdk";
 
@@ -258,12 +261,14 @@ export class ZipArtifactReader implements ArtifactReader {
       }),
     )) {
       assertArtifactReadActive(signal);
-      // The JDK refuses the whole archive for one encrypted record, so no
+      // The JDK refuses the whole archive for one record it rejects, so no
       // member of it is enumerated in that view.
-      if (this.#view === "jdk" && entry.encrypted)
+      const refusal =
+        this.#view === "jdk" ? jdkCentralDirectoryRefusal(entry) : undefined;
+      if (refusal !== undefined)
         throw new ArtifactReaderFailure(
           "format",
-          `ZIP member ${JSON.stringify(entry.filename)} is flagged encrypted in the central directory; the JDK refuses to open an archive holding an encrypted entry ("invalid CEN header (encrypted entry)")`,
+          `ZIP member ${JSON.stringify(entry.filename)} has a central-directory record the JDK rejects, so the JDK refuses to open the archive ("${refusal}")`,
         );
       // ZIP member identity is its directory occurrence, not its filename.
       // Logical path uniqueness belongs to the artifact inventory boundary.
@@ -286,6 +291,22 @@ export class ZipArtifactReader implements ArtifactReader {
         });
       yield metadata;
     }
+    // The JDK reads the central directory as whole records and refuses one
+    // that runs past it, bytes left after the last record, or a digital
+    // signature record there ("invalid CEN header (bad header size)"); zip.js
+    // tolerates each, noting the first two as trailing directory data.
+    if (
+      this.#view === "jdk" &&
+      (this.#reader.digitalSignature !== undefined ||
+        (this.#reader.warnings ?? []).some(
+          (warning) =>
+            warning.reason === WARNING_TRAILING_CENTRAL_DIRECTORY_DATA,
+        ))
+    )
+      throw new ArtifactReaderFailure(
+        "format",
+        `ZIP central directory does not end exactly at its last record, so the JDK refuses to open the archive ("invalid CEN header (bad header size)")`,
+      );
   }
 
   open(entry: ArtifactEntry, signal?: AbortSignal): Promise<Readable> {

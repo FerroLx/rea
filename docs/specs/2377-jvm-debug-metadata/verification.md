@@ -247,6 +247,36 @@ patched `javac` classes through a `URLClassLoader`) and fixed:
   or, for 0xcb, an earlier boundary `ClassFormatError`) leaves scopes
   `unknown` and the table `malformed`.
 
+## Independent audit follow-up
+
+An audit of the round above reproduced, and REA now matches, these JDK 21/25
+outcomes:
+
+- A misaligned `LocalVariableTypeTable` row with no `LocalVariableTable` row
+  (attribute absent, or present with zero rows) loads and verifies; REA had
+  reported it `malformed`. An out-of-range one is still refused
+  ("Invalid start_pc ... in LocalVariableTypeTable").
+- `jsr`, `jsr_w`, `ret` and `wide ret` in a version 51+ class are refused by
+  the verifier ("Bad instruction: a8", "Bad wide instruction"); they now make
+  the stream undecodable there.
+- A `lookupswitch` (or `tableswitch`) whose fixed operands reach `code_length`
+  is refused (`Bytecodes::special_length_at` compares with `>=`), including a
+  zero-pair `lookupswitch` ending exactly at the end of the code.
+- Every per-record refusal of OpenJDK 25 `ZipFile.Source.checkAndAddEntry`
+  (read from the JDK 25 bytecode) that zip.js does not already make is now
+  made by the JDK view: compression method other than 0/8, header size over
+  0xFFFF, an extra field overrunning the record, a zip64 block whose size does
+  not match the record's escape markers, and an escape marker on a record with
+  no extra data; plus initCEN's refusal of a central directory that does not
+  end at its last record. zip.js already refuses a bad record signature and
+  any zip64 value above 2^53 − 1 (stricter than the JDK). Each was checked
+  against `new JarFile(...)` on crafted archives.
+- REA stays stricter than `JarFile` where zip.js cross-checks the local header
+  or the data of a member it reads (the manifest or the selected class): a
+  local-only encryption flag, local/central size or method mismatch, or a
+  CRC-32 mismatch; and on any record, a zip64 value above 2^53 − 1. REA refuses
+  those JARs as malformed rather than answering.
+
 ## Still owed (follow-ups, not blocking)
 
 - A JDK-free CLI/MCP workflow test (e.g. `localToolContracts` pathRequests plus

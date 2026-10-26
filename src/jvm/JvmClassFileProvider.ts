@@ -278,8 +278,10 @@ export class JvmClassFileProvider implements JvmDebugMetadataPort {
       source,
       {
         // Name members as JarFile names them (UTF-8), and refuse the archive
-        // wherever JarFile refuses to open it (an invalid name, or any
-        // encrypted record), whichever member is requested.
+        // for every central-directory record JarFile's index rejects (an
+        // invalid name or comment, encryption, a compression method other
+        // than stored or deflated, an oversized header, or a malformed extra
+        // field), whichever member is requested.
         view: "jdk",
         // Only the manifest and the selected class are decompressed, so only
         // they are charged; an unrelated large member cannot refuse the read.
