@@ -404,6 +404,65 @@ const listEntries = async (path: string) => {
   }
 };
 
+describe("ZipArtifactReader opened expansion accounting", () => {
+  it("charges only opened members under opened accounting", async () => {
+    const directory = await createTestTempDirectory("rea-zip-budget-opened-");
+    // member-0 truthfully declares its 17 bytes; member-1 declares 2 GiB.
+    const path = await writeZipWithDeclaredSize(directory, [17, 2_147_483_647]);
+    const reader = new ZipArtifactReader(path, "zip", undefined, undefined, {
+      expansion: "opened",
+    });
+    try {
+      const entries = [];
+      for await (const entry of reader.entries()) entries.push(entry);
+      expect(entries).toHaveLength(2);
+      const chunks: Buffer[] = [];
+      for await (const chunk of await reader.open(entries[0]!))
+        chunks.push(Buffer.from(chunk));
+      expect(Buffer.concat(chunks).toString()).toBe("real member bytes");
+      await expect(reader.open(entries[1]!)).rejects.toMatchObject({
+        reason: "limit",
+        boundary: "capacity",
+        limit: {
+          key: "max_decompressed_bytes",
+          maximum: MINIMUM_ARTIFACT_EXPANDED_BYTES,
+        },
+      });
+    } finally {
+      await reader.close();
+    }
+  });
+});
+
+describe("ZipArtifactReader JDK view", () => {
+  it("refuses enumeration when any record is encrypted, as JarFile does", async () => {
+    const directory = await createTestTempDirectory("rea-zip-jdk-encrypted-");
+    const path = join(directory, "encrypted.zip");
+    const writer = new ZipWriter(new Uint8ArrayWriter());
+    await writer.add("plain.txt", new TextReader("plain"));
+    await writer.add("secret.txt", new TextReader("secret"), {
+      password: "key",
+    });
+    await writeFile(path, await writer.close());
+    const legacy = new ZipArtifactReader(path, "zip");
+    const jdk = new ZipArtifactReader(path, "zip", undefined, undefined, {
+      view: "jdk",
+    });
+    try {
+      expect(await enumerate(legacy)).toBe(2);
+      await expect(enumerate(jdk)).rejects.toMatchObject({
+        reason: "format",
+        message: expect.stringContaining(
+          "invalid CEN header (encrypted entry)",
+        ) as string,
+      });
+    } finally {
+      await legacy.close();
+      await jdk.close();
+    }
+  });
+});
+
 describe("ZipArtifactReader member names", () => {
   it("keeps the raw central-directory name as storedPath when a Unicode Path field renames the member", async () => {
     const directory = await createTestTempDirectory("rea-zip-unicode-path-");

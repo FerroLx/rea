@@ -276,9 +276,15 @@ export class JvmClassFileProvider implements JvmDebugMetadataPort {
       "zip",
       JVM_LIMITS.archiveMetadataBytes,
       source,
-      // The JDK decodes every member name as UTF-8 and refuses an archive
-      // holding one that is not, so members are named as JarFile names them.
-      "utf-8",
+      {
+        // Name members as JarFile names them (UTF-8), and refuse the archive
+        // wherever JarFile refuses to open it (an invalid name, or any
+        // encrypted record), whichever member is requested.
+        view: "jdk",
+        // Only the manifest and the selected class are decompressed, so only
+        // they are charged; an unrelated large member cannot refuse the read.
+        expansion: "opened",
+      },
     );
     const readerLease = new AnalysisCleanupLease(() => reader.close());
     let result: Result<JvmDebugMetadataExecution, AnalysisError>;
@@ -386,8 +392,9 @@ export class JvmClassFileProvider implements JvmDebugMetadataPort {
     const byRelease = new Map<number | null, ArtifactEntry[]>();
     for await (const member of reader.entries(signal)) {
       // The JDK finds members by stored name and ignores external attributes,
-      // so every kind is matched here; an unreadable match (encrypted, or a
-      // symlink the reader does not read) is reported as such, never absent.
+      // so every kind is matched here; an unreadable match (a symlink the
+      // reader does not read) is reported as such, never absent. The JDK view
+      // has already refused an archive holding any encrypted record.
       // The manifest matches in any ASCII case and the last such member wins;
       // a `./`-prefixed name is not the manifest.
       if (isJarManifestName(member.storedPath ?? member.path)) {
@@ -489,14 +496,6 @@ export class JvmClassFileProvider implements JvmDebugMetadataPort {
           `The selected entry ${entry} is stored as a ZIP ${member.kind}, which REA does not read as member bytes; its debug metadata is unavailable, not absent.`,
         ),
       );
-    if (member.encrypted)
-      return err(
-        new AnalysisUnsupportedTargetError(
-          OPERATION,
-          jar,
-          `The selected entry ${entry} is encrypted and cannot be read without a key; its debug metadata is unavailable, not absent.`,
-        ),
-      );
     return ok({
       member,
       release: selection.release,
@@ -523,12 +522,6 @@ export class JvmClassFileProvider implements JvmDebugMetadataPort {
       return {
         kind: "unknown",
         reason: `The JAR manifest member ${name} is stored as a ZIP ${manifest.kind}, which the JDK reads as a file but REA does not read`,
-      };
-    // The JDK refuses to open a JAR with an encrypted entry at all.
-    if (manifest.encrypted)
-      return {
-        kind: "unknown",
-        reason: `The JAR manifest member ${name} is encrypted and cannot be read without a key (the JDK refuses to open a JAR holding an encrypted entry)`,
       };
     if (
       manifest.declaredSize !== null &&

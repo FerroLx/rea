@@ -216,7 +216,7 @@ const LIMIT_REMEDIATION: Readonly<Record<ArtifactLimitBoundary, string>> = {
   memory:
     "The JAR's central directory exceeds REA's fixed metadata read budget; this archive cannot be inspected as is.",
   capacity:
-    "The JAR's members declare more uncompressed bytes than REA's fixed decompression budget for an archive of this size allows; this archive cannot be inspected as is.",
+    "The JAR members REA must decompress (its manifest and the selected class) declare more uncompressed bytes than REA's fixed decompression budget for an archive of this size allows; this archive cannot be inspected as is.",
 };
 
 const readerFailure = (

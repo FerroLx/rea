@@ -289,7 +289,10 @@ Use `inspect_jvm_debug_metadata` for a selected local `.class` file, or a class
 compiler-emitted `SourceFile`, `LineNumberTable`, `LocalVariableTable` and
 `LocalVariableTypeTable` and classifies each method's debugging readiness
 (`present | partial | stripped | malformed | not-applicable`), binding bytecode
-offsets, local slots and scope ranges to the method's name and descriptor. No
+offsets, local slots and scope ranges to the method's name and descriptor. A
+JAR is read as `JarFile` reads it: one holding any encrypted record is refused,
+only the manifest and the selected class count against the decompression
+budget, and a `META-INF/` entry is never versioned. No
 Java executes; `SourceDebugExtension` is reported by presence and length only; decompiler line numbers are
 never substituted for compiler positions.
 

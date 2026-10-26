@@ -49,7 +49,10 @@ resource that never supplies the entry, an override, or an ambiguity. Stored
 names are decoded as the JDK's `JarFile` decodes them: as UTF-8 whether or not
 the ZIP language-encoding flag is set. A JAR holding a member name or entry
 comment that is not valid UTF-8 is refused as invalid input, because the JDK
-refuses to open it ("invalid CEN header (bad entry name or comment)").
+refuses to open it ("invalid CEN header (bad entry name or comment)"). So is a
+JAR whose central directory flags any member as encrypted, whichever member is
+requested: the JDK refuses to open it too ("invalid CEN header (encrypted
+entry)", OpenJDK 21 and 25).
 
 A JAR is multi-release exactly when the JDK's `JarFile.isMultiRelease()` would
 say so (OpenJDK 25, default settings): the manifest is the member stored as
@@ -63,8 +66,8 @@ makes the JAR not multi-release, as does a manifest declaring more than the
 JDK's default `jdk.jar.maxSignatureFileSize` of 16,000,000 bytes. Like the JDK,
 REA ignores ZIP external attributes: only a trailing `/` makes a member a
 directory, so a manifest or class member marked as a directory by Unix-mode or
-MS-DOS attributes is read as a file. A manifest REA cannot read, such as an
-encrypted one or one stored as a symlink, leaves the multi-release status
+MS-DOS attributes is read as a file. A manifest REA cannot read, such as one
+stored as a symlink, leaves the multi-release status
 unknown: a call that needs it is refused as unsupported rather than treating the
 JAR as not multi-release. A release is a
 `META-INF/versions/<N>/` directory whose `<N>` is a decimal number from 9 to
@@ -188,9 +191,11 @@ refused as invalid input, as HotSpot refuses it, as is a class whose
 `double` (its second slot would lie outside the pool), or whose field, method
 or class attribute has a name index that does not name a `CONSTANT_Utf8`
 entry. A JAR whose central directory
-exceeds the metadata read budget, or whose members declare more uncompressed
-bytes than its decompression budget allows, is refused with that bound named in
-`reported_limits` (`max_metadata_read_bytes` or `max_decompressed_bytes`).
+exceeds the metadata read budget, or whose manifest and selected class (the
+only members REA decompresses) declare more uncompressed bytes than its
+decompression budget allows, is refused with that bound named in
+`reported_limits` (`max_metadata_read_bytes` or `max_decompressed_bytes`);
+other members' declared sizes are not charged, as the JDK does not read them.
 
 Verified by the `verify:jvm` real lane, which compiles owned `javac` fixtures
 with `-g` and `-g:none` and cross-checks the decoded facts against `javap` —

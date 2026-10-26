@@ -266,18 +266,42 @@ describe("JvmClassFileProvider JAR safety and format", () => {
     ]);
   });
 
-  it("reports an encrypted matching member as unavailable, not absent", async () => {
-    const writer = new ZipWriter(new Uint8ArrayWriter());
-    await writer.add(ENTRY, new Uint8ArrayReader(minimalClass(52)), {
-      password: "secret",
-    });
-    const path = await writeJar("encrypted.jar", await writer.close());
-    const result = await provider.inspect({ path, entry: ENTRY });
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
-    expect(result.error._tag).toBe("AnalysisUnsupportedTargetError");
-    expect(result.error.message.toLowerCase()).toContain("encrypted");
-  });
+  it.each([
+    ["the requested class", ENTRY],
+    ["an unrelated member", "other.txt"],
+    ["the manifest", "META-INF/MANIFEST.MF"],
+  ])(
+    "refuses the whole JAR when %s is encrypted, as JarFile does",
+    async (_label, encrypted) => {
+      // OpenJDK 21/25: new JarFile(...) throws "invalid CEN header (encrypted
+      // entry)" for any encrypted central-directory record.
+      const writer = new ZipWriter(new Uint8ArrayWriter());
+      for (const name of ["META-INF/MANIFEST.MF", ENTRY, "other.txt"])
+        await writer.add(
+          name,
+          name === ENTRY
+            ? new Uint8ArrayReader(minimalClass(52))
+            : new TextReader(PLAIN_MANIFEST),
+          name === encrypted ? { password: "secret" } : {},
+        );
+      const path = await writeJar(
+        `encrypted-${encrypted.replaceAll("/", "-")}.jar`,
+        await writer.close(),
+      );
+      const result = await provider.inspect({ path, entry: ENTRY });
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect((result.error as AnalysisInputError).issues).toEqual([
+        expect.objectContaining({
+          path: ["path"],
+          reason: "invalid_format",
+          message: expect.stringContaining(
+            "invalid CEN header (encrypted entry)",
+          ),
+        }),
+      ]);
+    },
+  );
 
   it("steers a Mach-O universal binary (shared 0xCAFEBABE magic) to inspect_macho", async () => {
     // Fat header: magic CAFEBABE, nfat_arch = 2 -> u2@6 = 2, below any class major.
@@ -536,26 +560,6 @@ describe("JvmClassFileProvider manifest member attributes", () => {
     if (result.ok) return;
     expect(result.error._tag).toBe("AnalysisUnsupportedTargetError");
     expect(result.error.message).toContain("unavailable, not absent");
-  });
-});
-
-describe("JvmClassFileProvider unreadable manifest", () => {
-  it("reports an encrypted manifest's multi-release status as unknown", async () => {
-    const writer = new ZipWriter(new Uint8ArrayWriter());
-    await writer.add("META-INF/MANIFEST.MF", new TextReader(MR_MANIFEST), {
-      password: "secret",
-    });
-    await writer.add(ENTRY, new Uint8ArrayReader(minimalClass(52)));
-    const result = await provider.inspect({
-      path: await writeJar("encrypted-manifest.jar", await writer.close()),
-      entry: ENTRY,
-      release: 17,
-    });
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
-    expect(result.error._tag).toBe("AnalysisUnsupportedTargetError");
-    expect(result.error.message).toContain("is encrypted");
-    expect(result.error.message).toContain("multi-release JAR is unknown");
   });
 });
 

@@ -250,26 +250,44 @@ cliTest(
 );
 
 cliTest(
-  "reports the ZIP decompression budget a JAR exceeds over CLI and MCP",
+  "charges only the JAR members it decompresses to the ZIP budget over CLI and MCP",
   async ({ cli }) => {
     const root = await createTestTempDirectory("rea-jvm-zip-limit-");
     const { client, call } = await connectLocalToolsMcp();
-    const path = join(root, "declares-more.jar");
-    // One member declares 300 MiB uncompressed: past the 256 MiB minimum
-    // decompression budget of a small archive, not the class-file size limit.
+    // A member declaring 300 MiB is past the 256 MiB minimum decompression
+    // budget of a small archive. JarFile reads Example.class whatever an
+    // unrelated member declares, and REA only decompresses the manifest and
+    // the selected class.
+    const big = {
+      name: Buffer.from("big.bin"),
+      bytes: Buffer.from("x"),
+      declaredSize: 300 * 1024 * 1024,
+    };
+    const unrelated = join(root, "unrelated-large.jar");
     await writeFile(
-      path,
+      unrelated,
       storedZip([
         { name: Buffer.from("Example.class"), bytes: jvmDebugClass() },
-        {
-          name: Buffer.from("big.bin"),
-          bytes: Buffer.from("x"),
-          declaredSize: 300 * 1024 * 1024,
-        },
+        big,
       ]),
     );
+    const read = await inspectBoth(cli, call, {
+      path: unrelated,
+      entry: "Example.class",
+    });
+    if (!read.ok) throw new Error(JSON.stringify(read.error));
+    expect(read.evidence).toMatchObject({
+      normalized_result: { selected_entry: { entry: "Example.class" } },
+    });
+    // The selected member itself declaring that much is refused before it is
+    // decompressed, with the bound it exceeds.
+    const selected = join(root, "selected-large.jar");
+    await writeFile(
+      selected,
+      storedZip([{ ...big, name: Buffer.from("Example.class") }]),
+    );
     const outcome = await inspectBoth(cli, call, {
-      path,
+      path: selected,
       entry: "Example.class",
     });
     expect(outcome).toMatchObject({
@@ -286,6 +304,58 @@ cliTest(
       (outcome as { error: { details: { reported_limits: object } } }).error
         .details.reported_limits,
     ).not.toHaveProperty("max_input_bytes");
+    await client.ping();
+  },
+  30000,
+);
+
+cliTest(
+  "refuses a JAR holding any encrypted record, as JarFile does, over CLI and MCP",
+  async ({ cli }) => {
+    const root = await createTestTempDirectory("rea-jvm-encrypted-");
+    const { client, call } = await connectLocalToolsMcp();
+    // OpenJDK 21/25: new JarFile(...) throws "invalid CEN header (encrypted
+    // entry)" when any central-directory record sets flag bit 0, so neither
+    // the requested class nor any other member is readable.
+    const manifest = Buffer.from("Manifest-Version: 1.0\r\n\r\n");
+    for (const encrypted of ["other.txt", "META-INF/MANIFEST.MF"]) {
+      const path = join(root, `${encrypted.replaceAll("/", "-")}.jar`);
+      await writeFile(
+        path,
+        storedZip(
+          [
+            { name: "META-INF/MANIFEST.MF", bytes: manifest },
+            { name: "Example.class", bytes: jvmDebugClass() },
+            { name: "other.txt", bytes: Buffer.from("x") },
+          ].map(({ name, bytes }) => ({
+            name: Buffer.from(name),
+            bytes,
+            ...(name === encrypted ? { flags: 0x0001 } : {}),
+          })),
+        ),
+      );
+      const outcome = await inspectBoth(cli, call, {
+        path,
+        entry: "Example.class",
+      });
+      expect(outcome).toMatchObject({
+        ok: false,
+        error: {
+          code: "invalid_request",
+          details: {
+            issues: [
+              {
+                path: ["path"],
+                reason: "invalid_format",
+                message: expect.stringContaining(
+                  "invalid CEN header (encrypted entry)",
+                ) as string,
+              },
+            ],
+          },
+        },
+      });
+    }
     await client.ping();
   },
   30000,

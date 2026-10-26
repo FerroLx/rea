@@ -179,35 +179,60 @@ class NodeFileReader extends Reader<string> {
 }
 
 /**
- * How member names without the language-encoding flag are decoded.
- * `zip-legacy` is the ZIP specification's CP437 (as Python's zipfile reads
- * it). `utf-8` is OpenJDK's `ZipFile`/`JarFile` view at the default charset:
- * every name and entry comment is UTF-8 whatever the flag says, and one that
- * is not valid UTF-8 makes the JDK refuse the whole archive ("invalid CEN
- * header (bad entry name or comment)"), so it fails enumeration as `format`.
+ * Whose reading of the archive this reader reproduces.
+ * `zip-legacy` follows the ZIP specification: unflagged member names are CP437
+ * (as Python's zipfile reads them) and an encrypted member is enumerated but
+ * cannot be opened. `jdk` is OpenJDK's `ZipFile`/`JarFile` view at the default
+ * charset, and fails enumeration as `format` wherever the JDK refuses to open
+ * the whole archive: every name and entry comment is UTF-8 whatever the flag
+ * says, so one that is not valid UTF-8 is refused ("invalid CEN header (bad
+ * entry name or comment)"), and so is any central-directory record with the
+ * encryption flag (bit 0) set, whichever member it names ("invalid CEN header
+ * (encrypted entry)", OpenJDK 21 and 25; the local header's flag is not read).
  */
-export type ZipEntryNameCharset = "zip-legacy" | "utf-8";
+export type ZipArchiveView = "zip-legacy" | "jdk";
+
+/**
+ * When declared plaintext is charged to the archive's decompression budget.
+ * `enumerated` charges every readable member as it is listed, so a consumer
+ * that reads every member learns the total before writing anything. `opened`
+ * charges each member when it is opened, so a consumer that reads a few named
+ * members is bounded by what it decompresses, not by unrelated members.
+ */
+export type ZipExpansionAccounting = "enumerated" | "opened";
+
+export interface ZipArtifactReaderOptions {
+  readonly view?: ZipArchiveView;
+  readonly expansion?: ZipExpansionAccounting;
+}
 
 /** Lazy Zip64-capable reader with CRC and overlap verification on every read. */
 export class ZipArtifactReader implements ArtifactReader {
   readonly format: ZipPackageFormat;
-  readonly #names: ZipEntryNameCharset;
+  readonly #view: ZipArchiveView;
+  readonly #expansion: ZipExpansionAccounting;
   readonly #source: NodeFileReader;
   readonly #reader: ZipReader<string>;
   readonly #entries = new Map<
     string,
     { readonly source: Entry; readonly metadata: ArtifactEntry }
   >();
+  /** Declared plaintext of the members opened so far, in `opened` accounting. */
+  #openedBytes = 0;
   /** Optionally bound each metadata read before allocating its backing buffer. */
   constructor(
     path: string,
     format: ZipPackageFormat,
     maximumMetadataReadBytes?: number,
     admitted?: StableRegularFileDescriptor,
-    names: ZipEntryNameCharset = "zip-legacy",
+    {
+      view = "zip-legacy",
+      expansion = "enumerated",
+    }: ZipArtifactReaderOptions = {},
   ) {
     this.format = format;
-    this.#names = names;
+    this.#view = view;
+    this.#expansion = expansion;
     this.#source = new NodeFileReader(path, maximumMetadataReadBytes, admitted);
     this.#reader = new ZipReader(this.#source, {
       checkSignature: true,
@@ -229,33 +254,24 @@ export class ZipArtifactReader implements ArtifactReader {
     for await (const entry of typedZipFailures(
       this.#reader.getEntriesGenerator({
         decodeText:
-          this.#names === "utf-8" ? decodeJdkEntryText : decodeZipEntryText,
+          this.#view === "jdk" ? decodeJdkEntryText : decodeZipEntryText,
       }),
     )) {
       assertArtifactReadActive(signal);
+      // The JDK refuses the whole archive for one encrypted record, so no
+      // member of it is enumerated in that view.
+      if (this.#view === "jdk" && entry.encrypted)
+        throw new ArtifactReaderFailure(
+          "format",
+          `ZIP member ${JSON.stringify(entry.filename)} is flagged encrypted in the central directory; the JDK refuses to open an archive holding an encrypted entry ("invalid CEN header (encrypted entry)")`,
+        );
       // ZIP member identity is its directory occurrence, not its filename.
       // Logical path uniqueness belongs to the artifact inventory boundary.
-      const metadata = projectZipEntry(entry, index++, this.#names);
+      const metadata = projectZipEntry(entry, index++, this.#view);
       if (metadata === undefined) continue;
-      // zip.js enforces each member's declared output size, so this sum bounds streamed work.
-      if (
-        metadata.kind === "file" &&
-        !metadata.encrypted &&
-        metadata.declaredSize !== null &&
-        Number.isSafeInteger(metadata.declaredSize) &&
-        metadata.declaredSize >= 0
-      ) {
+      if (this.#expansion === "enumerated" && chargeable(metadata)) {
         declaredFileBytes += metadata.declaredSize;
-        const budget = artifactExpansionBudgetBytes(this.#source.size);
-        if (declaredFileBytes > budget)
-          throw new ArtifactReaderFailure(
-            "limit",
-            `ZIP entries declare ${String(declaredFileBytes)} uncompressed bytes, exceeding this archive's ${String(budget)}-byte decompression budget (${String(MINIMUM_ARTIFACT_EXPANDED_BYTES)}-byte minimum, ${String(ARTIFACT_EXPANSION_RATIO)}x archive size); a small archive cannot expand this far`,
-            {
-              boundary: "capacity",
-              limit: { key: "max_decompressed_bytes", maximum: budget },
-            },
-          );
+        this.#assertWithinExpansionBudget(declaredFileBytes, "entries declare");
       }
       const stored = this.#entries.get(metadata.adapterKey);
       if (stored !== undefined && !sameArtifactEntry(metadata, stored.metadata))
@@ -296,7 +312,37 @@ export class ZipArtifactReader implements ArtifactReader {
           "Encrypted ZIP entry is unsupported",
         ),
       );
+    if (this.#expansion === "opened") {
+      // A size that is not a safe byte count cannot be bounded, so it is
+      // charged as exceeding the budget rather than skipped.
+      const declared = chargeable(stored.metadata)
+        ? stored.metadata.declaredSize
+        : Number.POSITIVE_INFINITY;
+      try {
+        this.#assertWithinExpansionBudget(
+          this.#openedBytes + declared,
+          "opened members declare",
+        );
+      } catch (cause: unknown) {
+        return Promise.reject(cause as Error);
+      }
+      this.#openedBytes += declared;
+    }
     return Promise.resolve(extractStream(source, signal));
+  }
+
+  /** zip.js enforces each member's declared output size, so this sum bounds streamed work. */
+  #assertWithinExpansionBudget(declaredBytes: number, subject: string): void {
+    const budget = artifactExpansionBudgetBytes(this.#source.size);
+    if (declaredBytes <= budget) return;
+    throw new ArtifactReaderFailure(
+      "limit",
+      `ZIP ${subject} ${String(declaredBytes)} uncompressed bytes, exceeding this archive's ${String(budget)}-byte decompression budget (${String(MINIMUM_ARTIFACT_EXPANDED_BYTES)}-byte minimum, ${String(ARTIFACT_EXPANSION_RATIO)}x archive size); a small archive cannot expand this far`,
+      {
+        boundary: "capacity",
+        limit: { key: "max_decompressed_bytes", maximum: budget },
+      },
+    );
   }
 
   async close(): Promise<void> {
@@ -310,12 +356,22 @@ export class ZipArtifactReader implements ArtifactReader {
   }
 }
 
+/** A readable file member whose declared plaintext is a countable byte size. */
+const chargeable = (
+  metadata: ArtifactEntry,
+): metadata is ArtifactEntry & { readonly declaredSize: number } =>
+  metadata.kind === "file" &&
+  !metadata.encrypted &&
+  metadata.declaredSize !== null &&
+  Number.isSafeInteger(metadata.declaredSize) &&
+  metadata.declaredSize >= 0;
+
 const projectZipEntry = (
   entry: Entry,
   index: number,
-  names: ZipEntryNameCharset,
+  view: ZipArchiveView,
 ): ArtifactEntry | undefined => {
-  const storedName = zipStoredName(entry, names);
+  const storedName = zipStoredName(entry, view);
   const sourcePath = zipEntryPath(entry, storedName);
   // Only a trailing "/" on the raw stored central-directory name makes a ZIP
   // member a directory, as for the JDK's ZipEntry.isDirectory, Python's
@@ -362,7 +418,7 @@ const projectZipEntry = (
         : [
             `ZIP member name ${JSON.stringify(sourcePath)} has a leading current-directory prefix omitted from its logical path.`,
           ]),
-      ...legacyNameLimitations(entry, names),
+      ...legacyNameLimitations(entry, view),
     ],
     adapterKey: `zip-entry:${index}`,
     ...(path === storedName ? {} : { storedPath: storedName }),
@@ -376,10 +432,10 @@ const projectZipEntry = (
  */
 const legacyNameLimitations = (
   entry: Entry,
-  names: ZipEntryNameCharset,
+  view: ZipArchiveView,
 ): readonly string[] => {
   if (
-    names === "utf-8" ||
+    view === "jdk" ||
     entry.filenameUTF8 ||
     entry.extraFieldUnicodePath?.valid === true
   )
@@ -438,8 +494,8 @@ const decodeCp437 = (bytes: Uint8Array): string =>
  * Unicode Path extra field name, so the stored name is decoded from
  * `rawFilename` here.
  */
-const zipStoredName = (entry: Entry, names: ZipEntryNameCharset): string =>
-  names === "utf-8" || entry.bitFlag?.languageEncodingFlag === true
+const zipStoredName = (entry: Entry, view: ZipArchiveView): string =>
+  view === "jdk" || entry.bitFlag?.languageEncodingFlag === true
     ? decodeStrictZipUtf8(entry.rawFilename, "ZIP filename is not valid UTF-8")
     : decodeCp437(entry.rawFilename);
 
