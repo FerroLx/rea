@@ -25,7 +25,8 @@ export type JarSelection =
       readonly available: readonly number[];
     };
 
-const VERSIONS_PREFIX = "META-INF/versions/";
+const META_INF_PREFIX = "META-INF/";
+const VERSIONS_PREFIX = `${META_INF_PREFIX}versions/`;
 
 /** The largest version the JDK's ZIP index can represent (`Integer.MAX_VALUE`). */
 const MAX_JAR_VERSION = 2 ** 31 - 1;
@@ -37,6 +38,11 @@ const MAX_JAR_VERSION = 2 ** 31 - 1;
  * lower, zero-padded or overflowing) is an inert resource, never a release, and
  * yields `undefined`. REA lists every such release present; a running JDK only
  * consults versions up to its own feature release.
+ *
+ * `JarFile.getEntry` never versions a name under `META-INF/` (matched case
+ * sensitively): it always returns the base member, so a
+ * `META-INF/versions/<N>/META-INF/...` path overrides nothing and is a plain
+ * member reachable only by its own name (checked against OpenJDK 21 and 25).
  */
 export const parseVersionedJarEntry = (
   path: string,
@@ -50,7 +56,9 @@ export const parseVersionedJarEntry = (
   const release = Number(version);
   if (release < 9 || release > MAX_JAR_VERSION) return undefined;
   const entry = rest.slice(slash + 1);
-  return entry === "" ? undefined : { release, entry };
+  return entry === "" || entry.startsWith(META_INF_PREFIX)
+    ? undefined
+    : { release, entry };
 };
 
 /**

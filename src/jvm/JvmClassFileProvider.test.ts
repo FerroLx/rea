@@ -306,6 +306,36 @@ describe("JvmClassFileProvider JAR safety and format", () => {
 describe("JvmClassFileProvider multi-release identity", () => {
   const VERSIONED = `META-INF/versions/17/${ENTRY}`;
 
+  it("never selects a META-INF/versions/<N>/META-INF/ member as an override", async () => {
+    // OpenJDK 21/25 JarFile.getEntry("META-INF/Foo.class") returns the base
+    // member in a multi-release JAR; the versioned spelling is a plain member.
+    const base = "META-INF/Foo.class";
+    const nested = `META-INF/versions/17/${base}`;
+    const path = await writeJar(
+      "meta-inf-override.jar",
+      await buildZip([
+        { name: "META-INF/MANIFEST.MF", text: MR_MANIFEST },
+        { name: base, bytes: minimalClass(52) },
+        { name: nested, bytes: minimalClass(61) },
+      ]),
+    );
+    const v17 = await provider.inspect({ path, entry: base, release: 17 });
+    expect(v17.ok).toBe(false);
+    if (v17.ok) return;
+    expect((v17.error as AnalysisInputError).issues).toEqual([
+      expect.objectContaining({
+        path: ["release"],
+        message: expect.stringContaining("none (base only)"),
+      }),
+    ]);
+    const literal = await provider.inspect({ path, entry: nested });
+    if (!literal.ok) throw literal.error;
+    expect(literal.value.result).toMatchObject({
+      selected_entry: { entry: nested, release: null },
+      class: { major_version: 61 },
+    });
+  });
+
   it("refuses a versioned member path in a multi-release JAR and names entry + release", async () => {
     const result = await provider.inspect({
       path: await mrJar(),

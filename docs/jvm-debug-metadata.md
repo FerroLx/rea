@@ -70,7 +70,9 @@ JAR as not multi-release. A release is a
 `META-INF/versions/<N>/` directory whose `<N>` is a decimal number from 9 to
 2147483647 without leading zeros; other directories are inert resources. REA
 lists every such release present, while a running JDK only consults versions
-up to its own feature release.
+up to its own feature release. As in `JarFile.getEntry`, an entry under
+`META-INF/` is never versioned: `META-INF/versions/<N>/META-INF/...` overrides
+nothing and is a plain member selected by its own name.
 
 ## Interpret the result
 

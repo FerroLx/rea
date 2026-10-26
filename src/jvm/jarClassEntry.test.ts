@@ -120,4 +120,22 @@ describe("parseVersionedJarEntry", () => {
       parseVersionedJarEntry("meta-inf/versions/17/a/Foo.class"),
     ).toBeUndefined();
   });
+
+  it("never versions a META-INF/ name, as JarFile.getEntry does not", () => {
+    // OpenJDK 21/25: getEntry("META-INF/Foo.class") returns the base member
+    // even beside META-INF/versions/17/META-INF/Foo.class; only a name outside
+    // META-INF/ (matched case sensitively) is looked up per version.
+    expect(
+      classifyJarEntry(
+        "META-INF/versions/17/META-INF/Foo.class",
+        "META-INF/Foo.class",
+      ),
+    ).toBeUndefined();
+    expect(
+      parseVersionedJarEntry("META-INF/versions/17/META-INF/x/Foo.class"),
+    ).toBeUndefined();
+    expect(
+      parseVersionedJarEntry("META-INF/versions/17/meta-inf/Foo.class"),
+    ).toEqual({ release: 17, entry: "meta-inf/Foo.class" });
+  });
 });
