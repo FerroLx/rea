@@ -552,6 +552,10 @@ export const assembleClassDetail = async (
   const decodeAndRecord = (
     method: DexEncodedMethod,
   ): DexWorkError | null | Promise<DexWorkError | null> => {
+    // Checked again: those scans may have spent the budget, and the refusal
+    // must not depend on whether they paused.
+    const spent = outOfWork(work);
+    if (spent !== null) return spent;
     const decode = decodeMethodDebug(
       bytes,
       method,

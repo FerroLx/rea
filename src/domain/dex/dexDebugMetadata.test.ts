@@ -586,8 +586,9 @@ const pacedRun = async <T>(
   run: (work: DexWork) => Promise<T>,
   sliceUnits: number,
   abortAt = Number.POSITIVE_INFINITY,
+  limit = 50_000_000,
 ) => {
-  const budget = dexWorkBudget(50_000_000);
+  const budget = dexWorkBudget(limit);
   const state = { aborted: false };
   let mark = budget.remaining;
   let longest = 0;
@@ -675,6 +676,18 @@ describe("dexDebugMetadata paces long string checks", () => {
     const aborted = await pacedRun(detail, SLICE, 3);
     expect(aborted.result).toEqual({ ok: false, error: { kind: "cancelled" } });
     expect(aborted.spent).toBeLessThan(LENGTH);
+    // A budget spent inside the name check is refused at the same charge
+    // whether or not the check paused.
+    const refused = [SLICE, 1 << 30].map(
+      async (slice) => await pacedRun(detail, slice, Infinity, 2 * LENGTH),
+    );
+    const [small, large] = await Promise.all(refused);
+    expect(small!.result).toEqual({
+      ok: false,
+      error: { kind: "work-budget-exceeded", limit: 2 * LENGTH },
+    });
+    expect(large!.result).toEqual(small!.result);
+    expect(large!.spent).toBe(small!.spent);
   });
 
   it("pauses while checking one long class descriptor during a lookup", async () => {
