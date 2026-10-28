@@ -71,7 +71,15 @@ const UNREADABLE: StringFacts = 0;
 
 const validFacts = (jsonBytes: number): StringFacts => Math.max(4, jsonBytes);
 
-/** The one string scan in progress, kept across pauses. */
+/**
+ * Paused scans kept at once. Production keeps one: every caller asks again
+ * for the reference that paused before anything else. The headroom lets a
+ * caller interleave a few long strings and still finish each; past it the
+ * oldest is dropped and, if asked again, rescanned and recharged.
+ */
+const KEPT_SCANS_LIMIT = 16;
+
+/** A string scan in progress, kept across pauses. */
 interface StringScan extends StringHead {
   /** Where the terminator search resumes, until `bytes` is known. */
   searched: number;
@@ -95,7 +103,8 @@ export class DexStringResolver {
   readonly #strings = new Map<number, string | null>();
   /** Facts per `string_data` offset, so a string is scanned and charged once. */
   readonly #facts = new Map<number, StringFacts>();
-  #scan: StringScan | null = null;
+  /** Paused scans by `string_data` offset, at most {@link KEPT_SCANS_LIMIT}. */
+  readonly #scans = new Map<number, StringScan>();
   #retainedChars = 0;
   #retainedParams = 0;
   constructor(
@@ -187,21 +196,16 @@ export class DexStringResolver {
 
   /**
    * The string's facts, scanning it in {@link SCAN_STEP}-byte steps and
-   * pausing after a step when `pauseDue`. A paused scan is kept and the next
-   * call for the same string continues it, so nothing is charged twice.
-   *
-   * One scan is kept at a time. Every caller asks again for the reference that
-   * paused before asking for anything else (the walk re-reads the unit, and
-   * {@link DexStringResolver} callers settle one check at a time), so a kept
-   * scan is only replaced if a caller abandons it; returning to that string
-   * later would then scan and charge it again.
+   * pausing after a step when `pauseDue`. A paused scan is kept (see
+   * {@link KEPT_SCANS_LIMIT}) and the next call for the same string continues
+   * it, so nothing is charged twice.
    */
   #check(index: number, pauseDue: () => boolean): DexPausable<StringFacts> {
     const found = this.#lookup(index);
     if (typeof found === "number") return found;
-    let scan = this.#scan;
-    if (scan?.dataOffset === found.dataOffset) {
-      this.#scan = null;
+    let scan = this.#scans.get(found.dataOffset);
+    if (scan !== undefined) {
+      this.#scans.delete(found.dataOffset);
       // A continued scan steps before its first pause check: every call
       // makes progress.
       const settled = this.#run(index, scan, 1);
@@ -213,7 +217,7 @@ export class DexStringResolver {
     }
     for (;;) {
       if (pauseDue()) {
-        this.#scan = scan;
+        this.#keep(scan);
         return DEX_PAUSED;
       }
       const settled = this.#run(index, scan, 1);
@@ -223,16 +227,14 @@ export class DexStringResolver {
 
   /**
    * {@link validity}'s facts, scanned to the end without pausing. A kept scan
-   * of the same string is continued; one of another string is left alone.
+   * of the same string is continued; those of other strings are left alone.
    */
   #settled(index: number): StringFacts {
     const found = this.#lookup(index);
     if (typeof found === "number") return found;
-    let scan: StringScan;
-    if (this.#scan?.dataOffset === found.dataOffset) {
-      scan = this.#scan;
-      this.#scan = null;
-    } else {
+    let scan = this.#scans.get(found.dataOffset);
+    if (scan !== undefined) this.#scans.delete(found.dataOffset);
+    else {
       const first = this.#begin(index, found);
       if (typeof first === "number") return first;
       scan = first;
@@ -256,6 +258,14 @@ export class DexStringResolver {
       if (settled !== null) return this.#record(scan.dataOffset, settled);
     }
     return null;
+  }
+
+  #keep(scan: StringScan): void {
+    if (this.#scans.size >= KEPT_SCANS_LIMIT) {
+      const oldest = this.#scans.keys().next();
+      if (!oldest.done) this.#scans.delete(oldest.value);
+    }
+    this.#scans.set(scan.dataOffset, scan);
   }
 
   #record(dataOffset: number, facts: StringFacts): StringFacts {

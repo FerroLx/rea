@@ -172,3 +172,45 @@ describe("DexStringResolver charges each string once", () => {
     expect(resolver.string(0)).toBe("a".repeat(10));
   });
 });
+
+describe("DexStringResolver keeps paused scans", () => {
+  it("finishes interleaved long strings, charging each once", () => {
+    const length = 100_000;
+    const at = [DATA0, DATA0 + length + 8];
+    const bytes = new Uint8Array(at[1]! + length + 8);
+    const dv = new DataView(bytes.buffer);
+    at.forEach((offset, i) => {
+      dv.setUint32(STRING_IDS_OFF + i * 4, offset, true);
+      bytes.set(
+        [0x80 | (length & 0x7f), 0x80 | ((length >> 7) & 0x7f), length >> 14],
+        offset,
+      );
+      bytes.fill(0x61 + i, offset + 3, offset + 3 + length);
+    });
+    const header: DexHeader = {
+      ...fixture().header,
+      stringIdsSize: 2,
+      fileSize: bytes.length,
+      typeIdsSize: 0,
+    };
+    let charged = 0;
+    // Pauses after every step, and the caller alternates between the strings.
+    const resolver = new DexStringResolver(
+      bytes,
+      header,
+      (units) => (charged += units),
+      () => false,
+      () => true,
+    );
+    const answers: (boolean | undefined)[] = [undefined, undefined];
+    for (let round = 0; round < 100 && answers.includes(undefined); round += 1)
+      for (const i of [0, 1])
+        if (answers[i] === undefined) {
+          const v = resolver.validity(i);
+          if (typeof v === "boolean") answers[i] = v;
+        }
+    expect(answers).toEqual([true, true]);
+    // Each string is located and validated once.
+    expect(charged).toBe(2 * 2 * length);
+  });
+});
