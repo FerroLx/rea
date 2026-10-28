@@ -174,43 +174,64 @@ describe("DexStringResolver charges each string once", () => {
 });
 
 describe("DexStringResolver keeps paused scans", () => {
-  it("finishes interleaved long strings, charging each once", () => {
-    const length = 100_000;
-    const at = [DATA0, DATA0 + length + 8];
-    const bytes = new Uint8Array(at[1]! + length + 8);
-    const dv = new DataView(bytes.buffer);
-    at.forEach((offset, i) => {
-      dv.setUint32(STRING_IDS_OFF + i * 4, offset, true);
+  const length = 100_000;
+  /** `count` long strings, asked round-robin with a pause after every step. */
+  const roundRobin = (count: number) => {
+    const stride = length + 8;
+    const bytes = new Uint8Array(DATA0 + count * stride + 8);
+    const idsOff = DATA0 + count * stride;
+    const ids = new Uint8Array(count * 4);
+    for (let i = 0; i < count; i += 1) {
+      const offset = DATA0 + i * stride;
       bytes.set(
         [0x80 | (length & 0x7f), 0x80 | ((length >> 7) & 0x7f), length >> 14],
         offset,
       );
-      bytes.fill(0x61 + i, offset + 3, offset + 3 + length);
-    });
+      bytes.fill(0x61 + (i % 26), offset + 3, offset + 3 + length);
+      new DataView(ids.buffer).setUint32(i * 4, offset, true);
+    }
+    const all = new Uint8Array(idsOff + ids.length);
+    all.set(bytes.subarray(0, idsOff));
+    all.set(ids, idsOff);
     const header: DexHeader = {
       ...fixture().header,
-      stringIdsSize: 2,
-      fileSize: bytes.length,
+      stringIdsSize: count,
+      stringIdsOff: idsOff,
+      fileSize: all.length,
       typeIdsSize: 0,
     };
     let charged = 0;
-    // Pauses after every step, and the caller alternates between the strings.
     const resolver = new DexStringResolver(
-      bytes,
+      all,
       header,
       (units) => (charged += units),
       () => false,
       () => true,
     );
-    const answers: (boolean | undefined)[] = [undefined, undefined];
-    for (let round = 0; round < 100 && answers.includes(undefined); round += 1)
-      for (const i of [0, 1])
+    const answers: (boolean | undefined)[] = new Array<undefined>(count).fill(
+      undefined,
+    );
+    let rounds = 0;
+    for (; rounds < 1_000 && answers.includes(undefined); rounds += 1)
+      for (let i = 0; i < count; i += 1)
         if (answers[i] === undefined) {
           const v = resolver.validity(i);
           if (typeof v === "boolean") answers[i] = v;
         }
-    expect(answers).toEqual([true, true]);
-    // Each string is located and validated once.
-    expect(charged).toBe(2 * 2 * length);
+    return { answers, charged, ideal: count * 2 * length, rounds };
+  };
+
+  it("finishes interleaved long strings within the kept set, charging each once", () => {
+    const run = roundRobin(16);
+    expect(run.answers.every((v) => v === true)).toBe(true);
+    expect(run.charged).toBe(run.ideal);
+  });
+
+  it("still finishes every string when more are interleaved than it keeps", () => {
+    const run = roundRobin(17);
+    expect(run.answers.every((v) => v === true)).toBe(true);
+    // Only the string that found the set full is rescanned, one step per
+    // round until a slot frees.
+    expect(run.charged).toBeLessThan(run.ideal * 1.1);
   });
 });

@@ -48,11 +48,13 @@ export type DexStringCharge = (units: number) => void;
 /** A resolver answer, or {@link DEX_PAUSED} when a scan stopped for a pause. */
 export type DexPausable<T> = T | typeof DEX_PAUSED;
 
+/** A string id's data, located (`bytes`) or not yet (`null`). */
 interface StringHead {
   readonly dataOffset: number;
   /** First modified-UTF-8 byte, after the `utf16_size` uleb128. */
   readonly start: number;
   readonly utf16Size: number;
+  readonly bytes: Uint8Array | null;
 }
 
 interface RawString extends StringHead {
@@ -74,8 +76,9 @@ const validFacts = (jsonBytes: number): StringFacts => Math.max(4, jsonBytes);
 /**
  * Paused scans kept at once. Production keeps one: every caller asks again
  * for the reference that paused before anything else. The headroom lets a
- * caller interleave a few long strings and still finish each; past it the
- * oldest is dropped and, if asked again, rescanned and recharged.
+ * caller interleave a few long strings and still finish each; past it a newly
+ * paused scan is not kept (see `#keep`), and is rescanned and recharged once
+ * a slot frees.
  */
 const KEPT_SCANS_LIMIT = 16;
 
@@ -124,9 +127,11 @@ export class DexStringResolver {
   }
 
   /**
-   * Resolve a string-pool index to its text, or `null` when absent/malformed.
-   * Validity comes from the string's one scan ({@link validity}); only a
-   * valid string is decoded, and its bytes are not validated again.
+   * Resolve a string-pool index to its text, or `null` when absent/malformed
+   * or when the budget cannot cover the decode. Validity comes from the
+   * string's one scan ({@link validity}); only a valid string is decoded, and
+   * its bytes are not validated again. The decode itself is not paced: it
+   * runs only within the budget, and callers bound it by their output limit.
    */
   string(index: number): string | null {
     const raw = this.#raw(index);
@@ -136,6 +141,9 @@ export class DexStringResolver {
       return cached ?? null;
     if (this.spent() || this.#settled(index) === UNREADABLE) return null;
     this.charge(raw.bytes.length);
+    // A decode the budget cannot cover is refused before it runs: the caller
+    // sees the spent budget and refuses the whole call, so nothing is kept.
+    if (this.spent()) return null;
     const decoded = decodeValidModifiedUtf8(raw.bytes, raw.utf16Size);
     if (this.#retainedChars + decoded.length <= RETAINED_CHARS_LIMIT) {
       this.#retainedChars += decoded.length;
@@ -208,7 +216,7 @@ export class DexStringResolver {
       this.#scans.delete(found.dataOffset);
       // A continued scan steps before its first pause check: every call
       // makes progress.
-      const settled = this.#run(index, scan, 1);
+      const settled = this.#run(index, scan);
       if (settled !== null) return settled;
     } else {
       const first = this.#begin(index, found);
@@ -220,7 +228,7 @@ export class DexStringResolver {
         this.#keep(scan);
         return DEX_PAUSED;
       }
-      const settled = this.#run(index, scan, 1);
+      const settled = this.#run(index, scan);
       if (settled !== null) return settled;
     }
   }
@@ -239,33 +247,37 @@ export class DexStringResolver {
       if (typeof first === "number") return first;
       scan = first;
     }
-    return this.#run(index, scan, null) ?? UNREADABLE;
+    return this.#runToEnd(index, scan);
+  }
+
+  /** Steps `scan` until it settles. */
+  #runToEnd(index: number, scan: StringScan): StringFacts {
+    for (;;) {
+      const settled = this.#run(index, scan);
+      if (settled !== null) return settled;
+    }
   }
 
   /**
-   * Run up to `steps` steps of `scan` (all of them when null): its facts once
-   * settled, or null to go on. A spent budget ends it as unreadable, unmemoised:
-   * the caller refuses the whole call.
+   * One step of `scan`: its facts once settled, or null to go on. A spent
+   * budget ends it as unreadable, unmemoised: the caller refuses the whole
+   * call.
    */
-  #run(
-    index: number,
-    scan: StringScan,
-    steps: number | null,
-  ): StringFacts | null {
-    for (let n = 0; steps === null || n < steps; n += 1) {
-      if (this.spent()) return UNREADABLE;
-      const settled = this.#step(index, scan);
-      if (settled !== null) return this.#record(scan.dataOffset, settled);
-    }
-    return null;
+  #run(index: number, scan: StringScan): StringFacts | null {
+    if (this.spent()) return UNREADABLE;
+    const settled = this.#step(index, scan);
+    return settled === null ? null : this.#record(scan.dataOffset, settled);
   }
 
+  /**
+   * Keep a paused scan. When the set is full the newcomer is not kept, so the
+   * kept scans still finish and free their slots; the newcomer is rescanned
+   * when asked again. Evicting a kept scan instead would let a round-robin
+   * caller lose every scan just before asking for it again.
+   */
   #keep(scan: StringScan): void {
-    if (this.#scans.size >= KEPT_SCANS_LIMIT) {
-      const oldest = this.#scans.keys().next();
-      if (!oldest.done) this.#scans.delete(oldest.value);
-    }
-    this.#scans.set(scan.dataOffset, scan);
+    if (this.#scans.size < KEPT_SCANS_LIMIT)
+      this.#scans.set(scan.dataOffset, scan);
   }
 
   #record(dataOffset: number, facts: StringFacts): StringFacts {
@@ -280,7 +292,7 @@ export class DexStringResolver {
    */
   #begin(index: number, head: StringHead): StringFacts | StringScan {
     if (this.spent()) return UNREADABLE;
-    let text = "bytes" in head ? (head as RawString).bytes : null;
+    let text = head.bytes;
     let searched = head.start;
     if (text === null) {
       // A plain loop: most strings are short, and a native search would
@@ -399,7 +411,12 @@ export class DexStringResolver {
     const cursor = new DexCursor(this.bytes, dataOffset);
     const utf16Size = cursor.uleb128();
     if (!utf16Size.ok) return null;
-    return { dataOffset, start: cursor.offset, utf16Size: utf16Size.value };
+    return {
+      dataOffset,
+      start: cursor.offset,
+      utf16Size: utf16Size.value,
+      bytes: null,
+    };
   }
 
   #locate(index: number): RawString | null {
@@ -475,11 +492,6 @@ export class DexStringResolver {
   }
 
   /**
-   * The JVM-form descriptor of a method, e.g. `(Ljava/lang/String;I)V`, built
-   * from its `proto_id_item` { shorty_idx u4, return_type_idx u4,
-   * parameters_off u4 } and the `type_list` at `parameters_off`.
-   */
-  /**
    * The string and type ids a method's name and descriptor read: the name's
    * string id (null when out of range), and the return type then each
    * parameter type (null when the proto cannot be read; a parameter list that
@@ -538,6 +550,14 @@ export class DexStringResolver {
     return total;
   }
 
+  /**
+   * The JVM-form descriptor of a method, e.g. `(Ljava/lang/String;I)V`, built
+   * from its `proto_id_item` { shorty_idx u4, return_type_idx u4,
+   * parameters_off u4 } and the `type_list` at `parameters_off`. `null` when
+   * the proto, its parameter list or any descriptor cannot be read, or when
+   * the budget cannot cover a decode ({@link string}); unlike
+   * {@link methodJsonBound}, it never answers from a partial list.
+   */
   methodDescriptor(methodIndex: number): string | null {
     if (methodIndex < 0 || methodIndex >= this.header.methodIdsSize)
       return null;

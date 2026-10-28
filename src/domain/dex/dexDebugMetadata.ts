@@ -604,7 +604,7 @@ export const assembleClassDetail = async (
     if (debug.localLimitExceeded || projected > outputLimit)
       return overBudget();
     const hasCode = method.codeOff !== 0;
-    methods.push({
+    const detail: DexMethodDetail = {
       name,
       descriptor,
       state: methodState(hasCode, debug),
@@ -624,7 +624,13 @@ export const assembleClassDetail = async (
         outOfRange: local.outOfRange,
       })),
       setFileEvents: debug.setFileEvents,
-    });
+    };
+    // The decodes above run within the budget or not at all; one that could
+    // not be covered (or an abort that arrived meanwhile) refuses the call
+    // rather than reporting a name as absent.
+    const decoded = outOfWork(work);
+    if (decoded !== null) return decoded;
+    methods.push(detail);
     return null;
   };
   if (walk.value !== "no-class-data") {
@@ -634,10 +640,13 @@ export const assembleClassDetail = async (
   }
   const spent = outOfWork(work);
   if (spent !== null) return err(spent);
-  return ok({
-    sourceFile: resolver.string(classDef.sourceFileIdx),
-    methods,
-  });
+  const sourceFile = resolver.string(classDef.sourceFileIdx);
+  // Checked after the last decodes: one the budget could not cover refuses
+  // rather than completing. When they filled a slice, the host is yielded to
+  // first, so an abort raised while they ran is observed.
+  const decoded = pacer.due ? await pacer.pause() : outOfWork(work);
+  if (decoded !== null) return err(decoded);
+  return ok({ sourceFile, methods });
 };
 
 /**

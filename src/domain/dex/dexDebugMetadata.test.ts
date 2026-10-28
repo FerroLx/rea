@@ -662,6 +662,52 @@ describe("dexDebugMetadata paces long string checks", () => {
     expect(paced.spent).toBe(whole.spent);
   });
 
+  it("refuses a source-file decode the budget cannot cover instead of completing over it", async () => {
+    const bytes = withLongStrings(1, 4 * LENGTH, () => []);
+    const { classDefsOff, view } = layoutOf(bytes);
+    view.setUint32(classDefsOff + 16, 6, true); // source_file_idx -> long string
+    // Enough to scan the name (located and validated: 2 x its length) but
+    // not to decode it as well.
+    const limit = 2.5 * 4 * LENGTH;
+    const refused = await pacedRun(runs(bytes)[1]!, 1 << 30, Infinity, limit);
+    expect(refused.result).toEqual({
+      ok: false,
+      error: { kind: "work-budget-exceeded", limit },
+    });
+    const whole = await pacedRun(runs(bytes)[1]!, 1 << 30);
+    expect(whole.result.ok).toBe(true);
+  });
+
+  it("observes an abort raised while the final source-file decode ran", async () => {
+    const bytes = withLongStrings(1, 4 * LENGTH, () => []);
+    const { classDefsOff, view } = layoutOf(bytes);
+    view.setUint32(classDefsOff + 16, 6, true); // source_file_idx -> long string
+    const parsed = parseDexFile(bytes);
+    if (!parsed.ok) throw new Error("fixture must frame");
+    // The abort arrives with the decode's charge (one charge of the whole
+    // name), as a host abort would while that synchronous decode runs.
+    let aborted = false;
+    let remaining = 50_000_000;
+    const budget = {
+      limit: 50_000_000,
+      get remaining() {
+        return remaining;
+      },
+      set remaining(value: number) {
+        if (remaining - value >= 4 * LENGTH) aborted = true;
+        remaining = value;
+      },
+    };
+    const result = await detailRun(parsed.value, bytes, {
+      budget,
+      cancelled: () => aborted,
+      yieldNow: () => Promise.resolve(),
+      sliceUnits: 1 << 30,
+    });
+    expect(aborted).toBe(true);
+    expect(result).toEqual({ ok: false, error: { kind: "cancelled" } });
+  });
+
   it("pauses while checking a long method name in the detail, so an abort lands there", async () => {
     const bytes = withLongStrings(1, 4 * LENGTH, () => []);
     const { view } = layoutOf(bytes);
