@@ -25,6 +25,9 @@ export const startModifiedUtf8Scan = (): ModifiedUtf8Scan => ({
   jsonBytes: 2,
 });
 
+const isContinuation = (byte: number | undefined): boolean =>
+  byte !== undefined && (byte & 0xc0) === 0x80;
+
 /**
  * Validate modified-UTF8 in place, allocating nothing, from `scan.at` to the
  * first sequence boundary at or past `until`. Returns `false` on any malformed
@@ -46,8 +49,6 @@ export const continueModifiedUtf8Scan = (
   scan: ModifiedUtf8Scan,
   until: number,
 ): boolean => {
-  const isContinuation = (byte: number | undefined): boolean =>
-    byte !== undefined && (byte & 0xc0) === 0x80;
   const stop = Math.min(until, bytes.length);
   let { at: i, units, jsonBytes } = scan;
   while (i < stop) {
@@ -85,27 +86,20 @@ export const continueModifiedUtf8Scan = (
   return true;
 };
 
-/**
- * The UTF-16 code units valid modified-UTF8 decodes to, or `null` when
- * {@link continueModifiedUtf8Scan} rejects it.
- */
-export const modifiedUtf8Units = (bytes: Uint8Array): number | null => {
-  const scan = startModifiedUtf8Scan();
-  return continueModifiedUtf8Scan(bytes, scan, bytes.length)
-    ? scan.units
-    : null;
-};
-
 const DECODE_CHUNK = 8192;
 
 /**
- * Decode already-validated modified-UTF8 into one flat string. Code units are
+ * Decode modified-UTF8 that {@link continueModifiedUtf8Scan} accepted, into
+ * one flat string of its `units` code units. Code units are
  * written to a typed array and converted in bounded chunks: per-character
  * concatenation would build a rope of tens of thousands of nodes per string.
  * Lone surrogates are preserved exactly (a UTF-16 TextDecoder would replace
  * them).
  */
-const decodeValidModifiedUtf8 = (bytes: Uint8Array, units: number): string => {
+export const decodeValidModifiedUtf8 = (
+  bytes: Uint8Array,
+  units: number,
+): string => {
   const out = new Uint16Array(units);
   let u = 0;
   let i = 0;
@@ -130,12 +124,6 @@ const decodeValidModifiedUtf8 = (bytes: Uint8Array, units: number): string => {
   for (let at = 0; at < units; at += DECODE_CHUNK)
     text += String.fromCharCode(...out.subarray(at, at + DECODE_CHUNK));
   return text;
-};
-
-/** Validate and decode in one step; `null` when the bytes are malformed. */
-export const decodeModifiedUtf8 = (bytes: Uint8Array): string | null => {
-  const units = modifiedUtf8Units(bytes);
-  return units === null ? null : decodeValidModifiedUtf8(bytes, units);
 };
 
 /**

@@ -102,3 +102,73 @@ describe("DexStringResolver.typeIdentity", () => {
       ).toBe("unreadable");
   });
 });
+
+/** A buffer whose one string runs `length` bytes, unterminated when `nul` is false. */
+const longString = (length: number, nul: boolean, fill = 0x61) => {
+  const bytes = new Uint8Array(64 + 3 + length + 1);
+  const dv = new DataView(bytes.buffer);
+  dv.setUint32(STRING_IDS_OFF, DATA0, true);
+  bytes.set(
+    [0x80 | (length & 0x7f), 0x80 | ((length >> 7) & 0x7f), length >> 14],
+    DATA0,
+  );
+  bytes.fill(fill, DATA0 + 3, DATA0 + 3 + length);
+  if (!nul) bytes.fill(0x61, DATA0 + 3 + length);
+  const header: DexHeader = {
+    ...fixture().header,
+    stringIdsSize: 1,
+    fileSize: bytes.length,
+    typeIdsSize: 0,
+  };
+  let charged = 0;
+  const state = { spent: false };
+  const resolver = new DexStringResolver(
+    bytes,
+    header,
+    (units) => (charged += units),
+    () => state.spent,
+  );
+  return { bytes, resolver, state, charged: () => charged };
+};
+
+describe("DexStringResolver charges each string once", () => {
+  it("charges an unterminated string once across validity, a re-ask and its JSON bound", () => {
+    const { resolver, charged } = longString(100_000, false);
+    expect(resolver.validity(0)).toBe(false);
+    const once = charged();
+    expect(once).toBeGreaterThanOrEqual(100_000);
+    expect(resolver.validity(0)).toBe(false);
+    expect(resolver.jsonBound(0)).toBe(4);
+    expect(resolver.string(0)).toBeNull();
+    expect(charged()).toBe(once);
+  });
+
+  it("returns a string known invalid as null without scanning or charging it again", () => {
+    const { bytes, resolver, charged } = longString(100_000, true);
+    bytes[DATA0 + 3 + 99_999] = 0xff; // never valid modified UTF-8
+    expect(resolver.validity(0)).toBe(false);
+    const once = charged();
+    expect(resolver.string(0)).toBeNull();
+    expect(resolver.jsonBound(0)).toBe(4);
+    expect(charged()).toBe(once);
+  });
+
+  it("decodes a valid string without validating it a second time", () => {
+    const { resolver, charged } = longString(100_000, true);
+    expect(resolver.validity(0)).toBe(true);
+    const scanned = charged();
+    expect(resolver.string(0)).toBe("a".repeat(100_000));
+    // The decode itself is charged; no second validation pass is.
+    expect(charged() - scanned).toBe(100_000);
+  });
+
+  it("does not memoise an id as unreadable while the budget is spent", () => {
+    const { resolver, state } = longString(10, true);
+    state.spent = true;
+    expect(resolver.validity(0)).toBe(false);
+    expect(resolver.string(0)).toBeNull();
+    state.spent = false;
+    expect(resolver.validity(0)).toBe(true);
+    expect(resolver.string(0)).toBe("a".repeat(10));
+  });
+});

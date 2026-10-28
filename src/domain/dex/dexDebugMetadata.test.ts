@@ -611,6 +611,8 @@ const pacedRun = async <T>(
 describe("dexDebugMetadata paces long string checks", () => {
   const LENGTH = 100_000;
   const SLICE = 1_000;
+  /** Bytes a string scan examines between pause checks. */
+  const SCAN_STEP = 16_384;
   const runs = (
     bytes: Uint8Array,
   ): readonly ((work: DexWork) => Promise<Result<unknown, DexWorkError>>)[] => {
@@ -640,7 +642,39 @@ describe("dexDebugMetadata paces long string checks", () => {
     view.setUint32(classDefsOff + 16, 6, true); // source_file_idx -> long string
     const paced = await pacedRun(runs(bytes)[0]!, SLICE);
     expect(paced.result.ok).toBe(true);
-    expect(paced.longest).toBeLessThan(LENGTH);
+    // A scan pauses after each 16 KiB step.
+    expect(paced.longest).toBeLessThanOrEqual(SLICE + SCAN_STEP);
+  });
+
+  it("does not re-validate a long, invalid source-file name when the detail reports it", async () => {
+    const bytes = withLongStrings(1, 4 * LENGTH, () => []);
+    const { classDefsOff, view } = layoutOf(bytes);
+    view.setUint32(classDefsOff + 16, 6, true); // source_file_idx -> long string
+    bytes[
+      view.getUint32(view.getUint32(60, true) + 24, true) + 3 + 4 * LENGTH - 1
+    ] = 0xff;
+    const paced = await pacedRun(runs(bytes)[1]!, SLICE);
+    expect(paced.result.ok).toBe(true);
+    expect(paced.longest).toBeLessThanOrEqual(SLICE + SCAN_STEP);
+    const whole = await pacedRun(runs(bytes)[1]!, 1 << 30);
+    expect(paced.result).toEqual(whole.result);
+    expect(paced.spent).toBe(whole.spent);
+  });
+
+  it("pauses while checking a long method name in the detail, so an abort lands there", async () => {
+    const bytes = withLongStrings(1, 4 * LENGTH, () => []);
+    const { view } = layoutOf(bytes);
+    view.setUint32(view.getUint32(92, true) + 4, 6, true); // method name -> long string
+    bytes[
+      view.getUint32(view.getUint32(60, true) + 24, true) + 3 + 4 * LENGTH - 1
+    ] = 0xff;
+    const detail = runs(bytes)[1]!;
+    const paced = await pacedRun(detail, SLICE);
+    expect(paced.result.ok).toBe(true);
+    expect(paced.longest).toBeLessThanOrEqual(SLICE + SCAN_STEP);
+    const aborted = await pacedRun(detail, SLICE, 3);
+    expect(aborted.result).toEqual({ ok: false, error: { kind: "cancelled" } });
+    expect(aborted.spent).toBeLessThan(LENGTH);
   });
 
   it("pauses while checking one long class descriptor during a lookup", async () => {

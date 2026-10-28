@@ -145,7 +145,11 @@ class DexPacer {
     this.#mark = work.budget.remaining;
   }
 
-  /** The budget's remaining work at or below which a slice is due. */
+  /**
+   * The budget's remaining work at or below which a slice is due: the one rule
+   * behind {@link due} and {@link pauseAt}. It moves only in {@link pause}, so
+   * a walk reads it once per resume instead of calling back per opcode.
+   */
   get threshold(): number {
     return this.#mark - this.work.sliceUnits;
   }
@@ -303,7 +307,7 @@ const decodeMethodDebug = (
       accessFlags: method.accessFlags,
       thisTypeIdx: classTypeIdx,
       paramTypes,
-      stringValid: resolver.referenceValidity,
+      stringValid: resolver.validity,
       typeValid: resolver.typeValidity,
     },
     options,
@@ -532,6 +536,22 @@ export const assembleClassDetail = async (
   ): DexWorkError | null | Promise<DexWorkError | null> => {
     const stop = outOfWork(work);
     if (stop !== null) return stop;
+    // The name and descriptor strings are scanned (paced) before
+    // recordMethod takes their bounds; `next` keeps progress across pauses.
+    const strings = resolver.methodStrings(method.methodIdx);
+    let next = 0;
+    const checked = settle(() => {
+      for (; next < strings.length; next += 1)
+        if (resolver.validity(strings[next]!) === DEX_PAUSED) return DEX_PAUSED;
+      return true;
+    }, pacer);
+    return checked instanceof Promise
+      ? checked.then((r) => (r.ok ? decodeAndRecord(method) : r.error))
+      : decodeAndRecord(method);
+  };
+  const decodeAndRecord = (
+    method: DexEncodedMethod,
+  ): DexWorkError | null | Promise<DexWorkError | null> => {
     const decode = decodeMethodDebug(
       bytes,
       method,

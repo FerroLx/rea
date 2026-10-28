@@ -8,7 +8,7 @@
  */
 import {
   continueModifiedUtf8Scan,
-  decodeModifiedUtf8,
+  decodeValidModifiedUtf8,
   type ModifiedUtf8Scan,
   startModifiedUtf8Scan,
 } from "../modifiedUtf8.js";
@@ -60,16 +60,16 @@ interface RawString extends StringHead {
 }
 
 /**
- * What one validation pass establishes about a string_data: whether it
- * decodes to its declared UTF-16 size, and the JSON bytes it serialises to (4
- * for the `null` an unreadable string resolves to).
+ * What one validation pass establishes about a string_data: the JSON bytes it
+ * serialises to (at least 4) when it decodes to its declared UTF-16 size, or
+ * {@link UNREADABLE}, whose `null` serialises to 4. A plain number, so
+ * checking many tiny strings allocates nothing per string.
  */
-interface StringFacts {
-  readonly valid: boolean;
-  readonly jsonBound: number;
-}
+type StringFacts = number;
 
-const UNREADABLE: StringFacts = { valid: false, jsonBound: 4 };
+const UNREADABLE: StringFacts = 0;
+
+const validFacts = (jsonBytes: number): StringFacts => Math.max(4, jsonBytes);
 
 /** The one string scan in progress, kept across pauses. */
 interface StringScan extends StringHead {
@@ -114,19 +114,22 @@ export class DexStringResolver {
     if (memo.size < MEMO_LIMIT) memo.set(key, value);
   }
 
-  /** Resolve a string-pool index to its text, or `null` when absent/malformed. */
+  /**
+   * Resolve a string-pool index to its text, or `null` when absent/malformed.
+   * Validity comes from the string's one scan ({@link validity}); only a
+   * valid string is decoded, and its bytes are not validated again.
+   */
   string(index: number): string | null {
     const raw = this.#raw(index);
     if (raw === null) return null;
     const cached = this.#strings.get(raw.dataOffset);
     if (cached !== undefined || this.#strings.has(raw.dataOffset))
       return cached ?? null;
-    if (this.spent()) return null;
+    if (this.spent() || this.#settled(index) === UNREADABLE) return null;
     this.charge(raw.bytes.length);
-    const decoded = this.#decode(raw);
-    const size = decoded?.length ?? 0;
-    if (this.#retainedChars + size <= RETAINED_CHARS_LIMIT) {
-      this.#retainedChars += size;
+    const decoded = decodeValidModifiedUtf8(raw.bytes, raw.utf16Size);
+    if (this.#retainedChars + decoded.length <= RETAINED_CHARS_LIMIT) {
+      this.#retainedChars += decoded.length;
       this.#remember(this.#strings, raw.dataOffset, decoded);
     }
     return decoded;
@@ -137,10 +140,10 @@ export class DexStringResolver {
    * allocating the decoded text (charged like a decode). Pauses mid-scan when
    * the caller's slice is due; call again with the same index to continue.
    */
-  validity(index: number): DexPausable<boolean> {
-    const facts = this.#settle(index, this.pauseDue);
-    return facts === DEX_PAUSED ? facts : facts.valid;
-  }
+  readonly validity = (index: number): DexPausable<boolean> => {
+    const facts = this.#check(index, this.pauseDue);
+    return facts === DEX_PAUSED ? facts : facts !== UNREADABLE;
+  };
 
   /** {@link validity} of a type id's descriptor string. */
   readonly typeValidity = (index: number): DexPausable<boolean> => {
@@ -148,16 +151,13 @@ export class DexStringResolver {
     return stringIdx === null ? false : this.validity(stringIdx);
   };
 
-  /** {@link validity} as a callback, for the debug stream's reference checks. */
-  readonly referenceValidity = (index: number): DexPausable<boolean> =>
-    this.validity(index);
-
   /**
    * Upper bound on the JSON bytes `string(index)` serialises to (4 for `null`),
    * computed from the raw bytes without decoding and memoised per string.
    */
   jsonBound(index: number): number {
-    return this.#settled(index).jsonBound;
+    const facts = this.#settled(index);
+    return facts === UNREADABLE ? 4 : facts;
   }
 
   /** JSON bound of a type id's descriptor string. */
@@ -166,57 +166,167 @@ export class DexStringResolver {
     return stringIdx === null ? 4 : this.jsonBound(stringIdx);
   }
 
-  #settled(index: number): StringFacts {
+  /**
+   * The memoised facts of `index`, or the string still to scan. An id that
+   * cannot be read, or whose string is unterminated, is memoised as such; a
+   * spent budget is not, because the caller refuses the whole call.
+   */
+  #lookup(index: number): StringFacts | StringHead {
+    let head: StringHead | null | undefined = this.#rawMemo.get(index);
+    if (head === null) return UNREADABLE;
+    if (head === undefined) {
+      if (this.spent()) return UNREADABLE;
+      head = this.#head(index);
+      if (head === null) {
+        this.#remember(this.#rawMemo, index, null);
+        return UNREADABLE;
+      }
+    }
+    return this.#facts.get(head.dataOffset) ?? head;
+  }
+
+  /**
+   * The string's facts, scanning it in {@link SCAN_STEP}-byte steps and
+   * pausing after a step when `pauseDue`. A paused scan is kept and the next
+   * call for the same string continues it, so nothing is charged twice.
+   *
+   * One scan is kept at a time. Every caller asks again for the reference that
+   * paused before asking for anything else (the walk re-reads the unit, and
+   * {@link DexStringResolver} callers settle one check at a time), so a kept
+   * scan is only replaced if a caller abandons it; returning to that string
+   * later would then scan and charge it again.
+   */
+  #check(index: number, pauseDue: () => boolean): DexPausable<StringFacts> {
+    const found = this.#lookup(index);
+    if (typeof found === "number") return found;
+    let scan = this.#scan;
+    if (scan?.dataOffset === found.dataOffset) {
+      this.#scan = null;
+      // A continued scan steps before its first pause check: every call
+      // makes progress.
+      const settled = this.#run(index, scan, 1);
+      if (settled !== null) return settled;
+    } else {
+      const first = this.#begin(index, found);
+      if (typeof first === "number") return first;
+      scan = first;
+    }
     for (;;) {
-      const facts = this.#settle(index, NEVER);
-      if (facts !== DEX_PAUSED) return facts;
+      if (pauseDue()) {
+        this.#scan = scan;
+        return DEX_PAUSED;
+      }
+      const settled = this.#run(index, scan, 1);
+      if (settled !== null) return settled;
     }
   }
 
   /**
-   * The string's facts, scanning it in steps and pausing after a step when
-   * `pauseDue`. The scan in progress survives a pause, so a later call for the
-   * same string continues it and charges nothing twice; every call makes at
-   * least one step of progress. A spent budget stops the scan as unreadable:
+   * {@link validity}'s facts, scanned to the end without pausing. A kept scan
+   * of the same string is continued; one of another string is left alone.
+   */
+  #settled(index: number): StringFacts {
+    const found = this.#lookup(index);
+    if (typeof found === "number") return found;
+    let scan: StringScan;
+    if (this.#scan?.dataOffset === found.dataOffset) {
+      scan = this.#scan;
+      this.#scan = null;
+    } else {
+      const first = this.#begin(index, found);
+      if (typeof first === "number") return first;
+      scan = first;
+    }
+    return this.#run(index, scan, null) ?? UNREADABLE;
+  }
+
+  /**
+   * Run up to `steps` steps of `scan` (all of them when null): its facts once
+   * settled, or null to go on. A spent budget ends it as unreadable, unmemoised:
    * the caller refuses the whole call.
    */
-  #settle(index: number, pauseDue: () => boolean): DexPausable<StringFacts> {
-    const known = this.#rawMemo.get(index);
-    if (known === undefined && this.#rawMemo.has(index)) return UNREADABLE;
-    const head = known ?? this.#head(index);
-    if (head === null) {
-      this.#remember(this.#rawMemo, index, null);
-      return UNREADABLE;
-    }
-    const facts = this.#facts.get(head.dataOffset);
-    if (facts !== undefined) return facts;
-    // Callers re-ask for the reference that paused, so the scan in progress is
-    // the one continued; asking for another string starts that one instead.
-    let scan = this.#scan;
-    if (scan?.dataOffset !== head.dataOffset) {
-      scan = {
-        ...head,
-        searched: head.start,
-        bytes: known?.bytes ?? null,
-        utf8: startModifiedUtf8Scan(),
-      };
-      this.#scan = scan;
-    }
-    for (;;) {
-      if (this.spent()) {
-        this.#scan = null;
-        return UNREADABLE;
-      }
+  #run(
+    index: number,
+    scan: StringScan,
+    steps: number | null,
+  ): StringFacts | null {
+    for (let n = 0; steps === null || n < steps; n += 1) {
+      if (this.spent()) return UNREADABLE;
       const settled = this.#step(index, scan);
-      if (settled !== null) {
-        this.#scan = null;
-        // An unterminated string is recorded by its (null) raw entry instead.
-        if (scan.bytes !== null)
-          this.#remember(this.#facts, scan.dataOffset, settled);
-        return settled;
-      }
-      if (pauseDue()) return DEX_PAUSED;
+      if (settled !== null) return this.#record(scan.dataOffset, settled);
     }
+    return null;
+  }
+
+  #record(dataOffset: number, facts: StringFacts): StringFacts {
+    this.#remember(this.#facts, dataOffset, facts);
+    return facts;
+  }
+
+  /**
+   * The first step of a new scan. A string short enough to locate and
+   * validate within one step settles here without allocating a saved scan;
+   * a longer one returns the scan to continue.
+   */
+  #begin(index: number, head: StringHead): StringFacts | StringScan {
+    if (this.spent()) return UNREADABLE;
+    let text = "bytes" in head ? (head as RawString).bytes : null;
+    let searched = head.start;
+    if (text === null) {
+      // A plain loop: most strings are short, and a native search would
+      // allocate a window per string.
+      const limit = Math.min(this.bytes.length, head.start + SCAN_STEP);
+      let end = head.start;
+      while (end < limit && this.bytes[end] !== 0x00) end += 1;
+      this.charge(end - head.start);
+      searched = end;
+      if (end < limit) text = this.#located(index, head, end);
+      else if (limit >= this.bytes.length)
+        return this.#record(head.dataOffset, this.#unterminated(index));
+    }
+    // Locating and validating together stay within one step.
+    if (text !== null && 2 * text.length <= SCAN_STEP) {
+      const utf8 = this.#scratch;
+      utf8.at = 0;
+      utf8.units = 0;
+      utf8.jsonBytes = 2;
+      this.charge(text.length);
+      const facts =
+        continueModifiedUtf8Scan(text, utf8, text.length) &&
+        utf8.units === head.utf16Size
+          ? validFacts(utf8.jsonBytes)
+          : UNREADABLE;
+      return this.#record(head.dataOffset, facts);
+    }
+    return {
+      dataOffset: head.dataOffset,
+      start: head.start,
+      utf16Size: head.utf16Size,
+      searched,
+      bytes: text,
+      utf8: startModifiedUtf8Scan(),
+    };
+  }
+
+  readonly #scratch: ModifiedUtf8Scan = startModifiedUtf8Scan();
+
+  /** Record a located string's raw bytes; returns them. */
+  #located(index: number, head: StringHead, end: number): Uint8Array {
+    const bytes = this.bytes.subarray(head.start, end);
+    if (this.#rawMemo.size < MEMO_LIMIT)
+      this.#rawMemo.set(index, {
+        dataOffset: head.dataOffset,
+        start: head.start,
+        utf16Size: head.utf16Size,
+        bytes,
+      });
+    return bytes;
+  }
+
+  /** An unterminated string: its id is memoised as unreadable. */
+  #unterminated(index: number): StringFacts {
+    this.#remember(this.#rawMemo, index, null);
+    return UNREADABLE;
   }
 
   /**
@@ -230,18 +340,9 @@ export class DexStringResolver {
       const end = found < 0 ? limit : scan.searched + found;
       this.charge(end - scan.searched);
       scan.searched = end;
-      if (found < 0) {
-        if (limit < this.bytes.length) return null;
-        this.#remember(this.#rawMemo, index, null); // unterminated
-        return UNREADABLE;
-      }
-      scan.bytes = this.bytes.subarray(scan.start, end);
-      this.#remember(this.#rawMemo, index, {
-        dataOffset: scan.dataOffset,
-        start: scan.start,
-        utf16Size: scan.utf16Size,
-        bytes: scan.bytes,
-      });
+      if (found < 0)
+        return limit < this.bytes.length ? null : this.#unterminated(index);
+      scan.bytes = this.#located(index, scan, end);
       return null;
     }
     const text = scan.bytes;
@@ -254,25 +355,18 @@ export class DexStringResolver {
     if (scan.utf8.at < text.length) return null;
     // A length that disagrees with the declared UTF-16 size is malformed.
     return scan.utf8.units === scan.utf16Size
-      ? { valid: true, jsonBound: Math.max(4, scan.utf8.jsonBytes) }
+      ? validFacts(scan.utf8.jsonBytes)
       : UNREADABLE;
-  }
-
-  #decode(raw: {
-    readonly bytes: Uint8Array;
-    readonly utf16Size: number;
-  }): string | null {
-    const decoded = decodeModifiedUtf8(raw.bytes);
-    // A length that disagrees with the declared UTF-16 size is malformed.
-    return decoded === null || decoded.length !== raw.utf16Size
-      ? null
-      : decoded;
   }
 
   /** The string's modified-UTF8 bytes (a view) and declared UTF-16 size, memoised. */
   #raw(index: number): RawString | null {
     const memo = this.#rawMemo.get(index);
     if (memo !== undefined || this.#rawMemo.has(index)) return memo ?? null;
+    // A spent budget means the caller will refuse the whole call; starting
+    // another (possibly member-sized) scan would only waste the time, and the
+    // id is not memoised as unreadable.
+    if (this.spent()) return null;
     const raw = this.#locate(index);
     this.#remember(this.#rawMemo, index, raw);
     return raw;
@@ -282,9 +376,6 @@ export class DexStringResolver {
 
   /** A string id's data offset and declared size, read in O(1). */
   #head(index: number): StringHead | null {
-    // A spent budget means the caller will refuse the whole call; starting
-    // another (possibly member-sized) scan would only waste the time.
-    if (this.spent()) return null;
     if (
       index < 0 ||
       index === DEX_NO_INDEX ||
@@ -379,6 +470,51 @@ export class DexStringResolver {
    * parameters_off u4 } and the `type_list` at `parameters_off`.
    */
   /**
+   * The string and type ids a method's name and descriptor read: the name's
+   * string id (null when out of range), and the return type then each
+   * parameter type (null when the proto cannot be read; a parameter list that
+   * is oversized or runs past the file contributes what was read).
+   */
+  #methodRefs(methodIndex: number): {
+    readonly name: number | null;
+    readonly types: readonly number[] | null;
+  } {
+    const name = this.#u4(this.header.methodIdsOff + methodIndex * 8 + 4);
+    const protoIndex = this.methodProtoIndex(methodIndex);
+    if (protoIndex === null) return { name, types: null };
+    const protoBase = this.header.protoIdsOff + protoIndex * 12;
+    const returnTypeIdx = this.#u4(protoBase + 4);
+    const parametersOff = this.#u4(protoBase + 8);
+    if (returnTypeIdx === null || parametersOff === null)
+      return { name, types: null };
+    const types = [returnTypeIdx];
+    if (parametersOff === 0) return { name, types };
+    const size = this.#u4(parametersOff);
+    if (size === null || size > DEX_MAX_PARAMETERS) return { name, types };
+    for (let i = 0; i < size; i += 1) {
+      const at = parametersOff + 4 + i * 2;
+      if (at + 2 > this.bytes.length) break;
+      types.push(this.view.getUint16(at, true));
+    }
+    return { name, types };
+  }
+
+  /**
+   * The string ids {@link methodJsonBound} reads, so a caller can check them
+   * one at a time ({@link validity}, pausing) before the bound is taken.
+   */
+  methodStrings(methodIndex: number): number[] {
+    if (methodIndex < 0 || methodIndex >= this.header.methodIdsSize) return [];
+    const { name, types } = this.#methodRefs(methodIndex);
+    const strings = name === null ? [] : [name];
+    for (const type of types ?? []) {
+      const stringIdx = this.#typeStringIndex(type);
+      if (stringIdx !== null) strings.push(stringIdx);
+    }
+    return strings;
+  }
+
+  /**
    * Upper bound on the JSON bytes of `methodDescriptor(methodIndex)` (and of
    * `methodName`), computed from the proto's type ids and memoised string
    * bounds without building the descriptor, so a caller can refuse before a
@@ -386,23 +522,9 @@ export class DexStringResolver {
    */
   methodJsonBound(methodIndex: number): number {
     if (methodIndex < 0 || methodIndex >= this.header.methodIdsSize) return 8;
-    const nameIdx = this.#u4(this.header.methodIdsOff + methodIndex * 8 + 4);
-    const nameBound = nameIdx === null ? 4 : this.jsonBound(nameIdx);
-    const protoIndex = this.methodProtoIndex(methodIndex);
-    if (protoIndex === null) return nameBound + 4;
-    const protoBase = this.header.protoIdsOff + protoIndex * 12;
-    const returnTypeIdx = this.#u4(protoBase + 4);
-    const parametersOff = this.#u4(protoBase + 8);
-    if (returnTypeIdx === null || parametersOff === null) return nameBound + 4;
-    let total = nameBound + 4 + this.typeJsonBound(returnTypeIdx);
-    if (parametersOff === 0) return total;
-    const size = this.#u4(parametersOff);
-    if (size === null || size > DEX_MAX_PARAMETERS) return total;
-    for (let i = 0; i < size; i += 1) {
-      const at = parametersOff + 4 + i * 2;
-      if (at + 2 > this.bytes.length) break;
-      total += this.typeJsonBound(this.view.getUint16(at, true));
-    }
+    const { name, types } = this.#methodRefs(methodIndex);
+    let total = (name === null ? 4 : this.jsonBound(name)) + 4;
+    for (const type of types ?? []) total += this.typeJsonBound(type);
     return total;
   }
 
